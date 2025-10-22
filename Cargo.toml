@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "kernel",
+    "boot",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+authors = ["dotslashCosmic"]
+edition = "2021"
+license = "GNU GPL 3.0"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true
+codegen-units = 1
