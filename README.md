@@ -1,57 +1,55 @@
 # CosmOS
-Custom Open-Source Modular Operating System is a fully custom kernel and bootloader, written in Rust and Assembly,, designed with memory safety and exploit resistance as core principles.
-CosmOS implements a hybrid kernel architecture targeting x86_64 bare-metal systems, and VMs.
+
+CosmOS (Custom Open-Source Modular Operating System) is a fully custom kernel and bootloader written in Rust and Assembly. It is designed with memory safety and exploit resistance as core principles.
 
 ## Architecture
 
-- **Target**: x86_64 bare-metal (`x86_64-unknown-none`)
-- **Language**: Rust (nightly toolchain, edition 2021)
-- **Boot**: Custom two-stage bootloader with BIOS/UEFI support
-- **Environment**: `#![no_std]` with selective `alloc` usage
-- **Security**: Hardware-enforced privilege separation (Ring 0/Ring 3)
-- **Memory Safety**: Rust ownership system prevents buffer overflows and use-after-free
-- **Privilege Separation**: Kernel (Ring 0) and userspace (Ring 3) isolation
-- **Minimal Attack Surface**: `no_std` environment with carefully selected dependencies
-- **Hardware Enforcement**: x86_64 protection rings and paging
+- Target: x86_64 bare-metal (`x86_64-unknown-none`)
+- Language: Rust (nightly toolchain, edition 2021)
+- Boot: Custom two-stage bootloader with BIOS/UEFI support
+- Environment: `#![no_std]` with selective `alloc` usage
+- Security & memory safety:
+  - Hardware-enforced privilege separation (Ring 0 / Ring 3)
+  - Rust ownership model to reduce buffer overflows and use-after-free
+- Minimal runtime dependencies to keep the attack surface small
 
-## Prerequisites (installed during just setup)
+## Prerequisites
 
-- Windows 10/11 (winget)
-- Rust nightly toolchain
+- Rust (nightly)
 - NASM assembler
-- QEMU/VirtualBox (optional, for testing)
+- QEMU or VirtualBox (for testing)
+- On Windows, the setup may use winget (PowerShell) for installing tools
 
-## Quick Start
+## Quick start
 
-Just type `just` for a one-line setup, build, and execution!
+Run the included `just` tasks to set up, build and run:
 
 ```bash
-# Setup (PowerShell required for dependency installation)
+# one-line setup, build, and run (PowerShell may be required for setup on Windows)
 just
-# or
+# or run steps individually:
 just setup
 just build
-just run-qemu # Qemu
+just run-qemu   # QEMU
 # or
-just run-vbox # VirtualBox
+just run-vbox   # VirtualBox
 ```
 
-## Boot Process
+## Boot process
 
-1. **Stage 1**: 512-byte MBR bootloader (sector 0)
-2. **Stage 2**: Extended bootloader (sectors 1-64, 32KB)
-3. **Kernel**: Flat binary loaded at sector 66+
+1. Stage 1: 512-byte MBR bootloader (sector 0)  
+2. Stage 2: Extended bootloader (sectors 1–64, ~32 KB)  
+3. Kernel: Flat binary loaded at sector 66+
 
-The bootloader creates a 64MB disk image with the kernel embedded directly, eliminating the need for a separate filesystem during boot.
+The bootloader creates a 64 MB disk image with the kernel embedded, avoiding a separate filesystem for initial boot.
 
 ## Development
 
-### Dependencies
-All dependencies use `default-features = false` for `no_std` compatibility:
-- `x86_64` - Hardware abstractions
-- `spin` - Synchronization primitives
-- `linked_list_allocator` - Heap management
+Dependencies are compiled with `default-features = false` for `no_std` compatibility:
+- `x86_64` — hardware abstractions
+- `spin` — synchronization primitives
+- `linked_list_allocator` — heap management
 
 ## License
 
-This project is licensed under the GNU GPL 3.0 License.
+This project is licensed under the GNU GPL v3.
