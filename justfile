@@ -16,6 +16,22 @@ build:
 build-debug:
     powershell -ExecutionPolicy Bypass -File cosmos.ps1 build -Mode debug
 
+# Build just the kernel ELF, no bootloader or disk image
+build-kernel:
+    @Write-Host "Building kernel ELF only..." -ForegroundColor Cyan
+    $env:RUSTFLAGS = "-C link-arg=-Tkernel/linker.ld"
+    cargo build --package cosmos --target x86_64-unknown-none --release
+    $env:RUSTFLAGS = ""
+    @Write-Host "Kernel ELF: target/x86_64-unknown-none/release/cosmos" -ForegroundColor Green
+
+# Build just the kernel ELF, debug mode
+build-kernel-debug:
+    @Write-Host "Building kernel ELF (debug) only..." -ForegroundColor Cyan
+    $env:RUSTFLAGS = "-C link-arg=-Tkernel/linker.ld"
+    cargo build --package cosmos --target x86_64-unknown-none --debug
+    $env:RUSTFLAGS = ""
+    @Write-Host "Kernel ELF: target/x86_64-unknown-none/debug/cosmos" -ForegroundColor Green
+
 # Clean and rebuild
 rebuild: 
     cargo clean
