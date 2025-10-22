@@ -9,23 +9,26 @@ SECTIONS
     /* Kernel entry point at 2mb */
     . = 0x200000;
 
-    .text :
+    .text : ALIGN(4K)
     {
         KEEP(*(.text._start))
         *(.text .text.*)
     }
 
-    .rodata : ALIGN(4K)
+    . = ALIGN(4K);
+    .rodata :
     {
         *(.rodata .rodata.*)
     }
 
-    .data : ALIGN(4K)
+    . = ALIGN(4K);
+    .data :
     {
         *(.data .data.*)
     }
 
-    .bss : ALIGN(4K)
+    . = ALIGN(4K);
+    .bss :
     {
         *(COMMON)
         *(.bss .bss.*)
@@ -33,6 +36,7 @@ SECTIONS
 
     /DISCARD/ :
     {
+        *(.eh_frame_hdr)
         *(.eh_frame)
         *(.note .note.*)
         *(.dynamic)
@@ -40,5 +44,9 @@ SECTIONS
         *(.dynstr)
         *(.hash)
         *(.gnu.hash)
+        *(.got)
+        *(.got.plt)
+        *(.plt)
+        *(.rela.*)
     }
 }
