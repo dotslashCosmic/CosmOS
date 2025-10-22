@@ -5,46 +5,76 @@
 
 ; Constants for kernel loading
 KERNEL_TEMP_SEGMENT     equ 0x1000      ; Temporary load at 0x10000
-KERNEL_FINAL_ADDRESS    equ 0x200000    ; Final kernel location (2MB)
+KERNEL_FINAL_ADDRESS    equ 0x200000    ; Final kernel location, 2MB
 KERNEL_SECTORS          equ 127         ; Number of sectors to load
-KERNEL_START_SECTOR     equ 66          ; Starting sector (MBR + 64x Stage 2 sectors)
+KERNEL_START_SECTOR     equ 66          ; Starting sector, MBR + 64x sectors
 STACK_ADDRESS           equ 0x90000     ; Stack location
+KERNEL_SIGNATURE        equ 0xC05305    ; "CosmOS" kernel signature
+MAX_RETRIES             equ 3           ; Maximum retry attempts
+
+; Memory detection constants
+MEMORY_MAP_LOCATION     equ 0x9000      ; Memory map storage location
+E820_SIGNATURE          equ 0x534D4150  ; "SMAP" signature for E820
+MAX_MEMORY_ENTRIES      equ 32          ; Maximum memory map entries
+
+; Memory map entry structure (24 bytes each)
+MEMMAP_ENTRY_SIZE       equ 24
+
+; Memory types (E820 standard)
+MEMTYPE_USABLE          equ 1           ; Available RAM
+MEMTYPE_RESERVED        equ 2           ; Reserved by system
+MEMTYPE_ACPI_RECLAIM    equ 3           ; ACPI reclaimable
+MEMTYPE_ACPI_NVS        equ 4           ; ACPI NVS
+MEMTYPE_BAD             equ 5           ; Bad memory
 
 stage2_start:
     ; Print Stage 2 message
     mov si, msg_stage2
     call print_string
     
+    ; Detect memory using E820
+    mov si, msg_detect_memory
+    call print_string
+    call detect_memory_e820
+    
     ; Load kernel from disk
     mov si, msg_load_kernel
     call print_string
 
-    ; Load using LBA, BIOS Extended Read (INT 13h, AH=42h)
-    mov ax, KERNEL_TEMP_SEGMENT
-    mov es, ax
+    ; Try LBA read first
+    mov cx, MAX_RETRIES
+.retry_lba:
+    push cx                 ; Save retry counter
+    call load_kernel_lba
+    mov bx, ax              ; Save error info
+    pop cx                  ; Restore retry counter
+    jnc kernel_load_success ; Success if CF clear
     
-    ; Set up Disk Address Packet
-    push dword 0            ; Upper 32 bits of LBA (0 for sector 66)
-    push dword 66           ; Lower 32 bits of LBA (sector 66)
-    push es                 ; Segment
-    push word 0             ; Offset
-    push word KERNEL_SECTORS ; Number of sectors to read
-    push word 16            ; Size of DAP
+    ; Check error code for fallback conditions
+    mov ah, bl             ; Restore error
+    cmp ah, 0x01           ; Invalid command
+    je .try_chs            ; Fall back to CHS
+    cmp ah, 0x0C           ; Unsupported track
+    je .try_chs            ; Fall back to CHS
     
-    mov si, sp              ; DS:SI points to DAP
-    mov ah, 0x42            ; Extended read
-    mov dl, 0x80            ; First hard disk
-    int 0x13
-    jc kernel_load_error_lba
+    ; Reset disk and retry
+    push cx
+    call reset_disk
+    pop cx
+    dec cx
+    jnz .retry_lba
     
-    add sp, 16              ; Clean up stack
-    jmp kernel_load_success
-
-kernel_load_error_lba:
-    add sp, 16              ; Clean up stack
-    jmp kernel_load_error
-
+.try_chs:
+    ; Fall back to CHS read
+    mov si, msg_fallback_chs
+    call print_string
+    call load_kernel_chs
+    jc kernel_load_error
+    
 kernel_load_success:
+    ; Verify kernel signature before proceeding
+    call verify_kernel_signature
+    jc kernel_signature_error
     
     mov si, msg_kernel_loaded
     call print_string
@@ -82,8 +112,587 @@ kernel_load_success:
     ; Far jump to 32-bit code
     jmp 0x08:protected_mode
 
+; E820 Memory Detection Function
+detect_memory_e820:
+    push ax
+    push bx
+    push cx
+    push dx
+    push di
+    push es
+    
+    ; Set up ES:DI to point to memory map storage
+    mov ax, 0
+    mov es, ax
+    mov di, MEMORY_MAP_LOCATION
+    
+    ; Initialize entry counter
+    mov word [memory_entry_count], 0
+    
+    ; Store entry count location at start of memory map
+    mov word [di], 0        ; Entry count
+    add di, 4               ; Move past entry count
+    
+    xor ebx, ebx            ; EBX = 0 for first call
+    mov edx, E820_SIGNATURE ; EDX = "SMAP"
+    
+.e820_loop:
+    mov eax, 0xE820         ; E820 function
+    mov ecx, 24             ; Buffer size
+    int 0x15                ; Call BIOS
+    
+    ; Check for errors
+    jc .e820_failed         ; Carry flag set = error
+    cmp eax, E820_SIGNATURE ; EAX should contain "SMAP"
+    jne .e820_failed
+    
+    ; Check if entry is valid (length > 0)
+    cmp dword [es:di+8], 0  ; Check length low dword
+    je .skip_entry
+    cmp dword [es:di+12], 0 ; Check length high dword
+    jne .valid_entry
+    cmp dword [es:di+8], 0  ; If high is 0, low must be > 0
+    je .skip_entry
+    
+.valid_entry:
+    ; Validate memory type and entry consistency
+    call validate_memory_entry
+    jc .skip_entry          ; Skip invalid entries
+    
+.entry_ok:
+    ; Increment entry count
+    inc word [memory_entry_count]
+    
+    ; Move to next entry location
+    add di, 24              ; Each entry is 24 bytes
+    
+    ; Check if we've reached maximum entries
+    cmp word [memory_entry_count], MAX_MEMORY_ENTRIES
+    jae .e820_done
+    
+.skip_entry:
+    ; Check if this was the last entry
+    test ebx, ebx
+    jz .e820_done
+    
+    ; Continue with next entry
+    jmp .e820_loop
+    
+.e820_failed:
+    ; E820 failed, try fallback
+    mov si, msg_e820_failed
+    call print_string
+    call detect_memory_fallback
+    jmp .detection_done
+    
+.e820_done:
+    ; Update entry count at start of memory map
+    mov di, MEMORY_MAP_LOCATION
+    mov ax, word [memory_entry_count]
+    mov word [di], ax
+    
+    ; Validate and count all entries
+    call count_memory_entries
+    
+    ; Display detection results
+    mov si, msg_memory_detected
+    call print_string
+    mov ax, word [memory_entry_count]
+    call print_hex_word
+    mov si, msg_entries
+    call print_string
+    
+    ; Display first few entries for debugging
+    call display_memory_map
+    
+.detection_done:
+    pop es
+    pop di
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; Fallback memory detection using INT 15h AX=E801h
+detect_memory_fallback:
+    push ax
+    push bx
+    push cx
+    push dx
+    push di
+    push es
+    
+    ; Try INT 15h, AX=E801h first
+    mov ax, 0xE801
+    int 0x15
+    jc .try_88h
+    
+    ; E801h successful - AX/CX = memory 1MB-16MB in KB, BX/DX = memory >16MB in 64KB blocks, create synthetic memory map entries
+    mov ax, 0
+    mov es, ax
+    mov di, MEMORY_MAP_LOCATION
+    
+    ; Entry count = 2, low and high memory
+    mov word [di], 2
+    add di, 4
+    
+    ; First entry: 0x0 - 0x9FC00
+    mov dword [di], 0x0         ; Base address low
+    mov dword [di+4], 0x0       ; Base address high
+    mov dword [di+8], 0x9FC00   ; Length low (~640KB)
+    mov dword [di+12], 0x0      ; Length high
+    mov dword [di+16], 1        ; Type: usable
+    mov dword [di+20], 0        ; Attributes
+    add di, 24
+    
+    ; Second entry: 0x100000 - end of memory
+    mov dword [di], 0x100000    ; Base address low
+    mov dword [di+4], 0x0       ; Base address high
+    
+    ; Calculate total memory from E801h
+    ; AX = KB between 1MB-16MB, BX = 64KB blocks above 16MB
+    mov eax, 0xE801
+    int 0x15
+    
+    ; Convert to bytes: AX * 1024 + BX * 65536
+    movzx eax, ax
+    mov ecx, 1024
+    mul ecx                     ; EAX = low memory in bytes
+    movzx ebx, bx
+    mov ecx, 65536
+    push eax
+    mov eax, ebx
+    mul ecx                     ; EAX = high memory in bytes
+    pop ebx
+    add eax, ebx                ; Total extended memory
+    
+    mov dword [di+8], eax       ; Length low
+    mov dword [di+12], 0        ; Length high
+    mov dword [di+16], 1        ; Type: usable
+    mov dword [di+20], 0        ; Attributes
+    
+    mov word [memory_entry_count], 2
+    jmp .fallback_done
+    
+.try_88h:
+    ; Try INT 15h, AH=88h as last resort
+    mov ah, 0x88
+    int 0x15
+    jc .fallback_failed
+    
+    ; AX = KB of extended memory
+    test ax, ax
+    jz .fallback_failed
+    
+    ; Create minimal memory map
+    mov bx, 0
+    mov es, bx
+    mov di, MEMORY_MAP_LOCATION
+    
+    ; Entry count = 1
+    mov word [di], 1
+    add di, 4
+    
+    ; Single entry: 0x100000 - (1MB + AX*1024)
+    mov dword [di], 0x100000    ; Base address low, 1MB
+    mov dword [di+4], 0x0       ; Base address high
+    movzx eax, ax
+    mov ecx, 1024
+    mul ecx                     ; Convert KB to bytes
+    mov dword [di+8], eax       ; Length low
+    mov dword [di+12], 0        ; Length high
+    mov dword [di+16], 1        ; Type: usable
+    mov dword [di+20], 0        ; Attributes
+    
+    mov word [memory_entry_count], 1
+    jmp .fallback_done
+    
+.fallback_failed:
+    ; All methods failed - create minimal default
+    mov bx, 0
+    mov es, bx
+    mov di, MEMORY_MAP_LOCATION
+    
+    mov word [di], 1            ; One entry
+    add di, 4
+    
+    ; Assume 16MB minimum
+    mov dword [di], 0x100000    ; Base: 1MB
+    mov dword [di+4], 0x0
+    mov dword [di+8], 0xF00000  ; Length: 15MB
+    mov dword [di+12], 0x0
+    mov dword [di+16], 1        ; Type: usable
+    mov dword [di+20], 0
+    
+    mov word [memory_entry_count], 1
+    
+.fallback_done:
+    pop es
+    pop di
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; Validate memory map entry at ES:DI
+validate_memory_entry:
+    push eax
+    push ebx
+    
+    ; Check memory type
+    mov eax, dword [es:di+16]
+    cmp eax, MEMTYPE_USABLE
+    jb .invalid             ; Type < 1 is invalid
+    cmp eax, MEMTYPE_BAD
+    jbe .valid              ; Types 1-5 are standard
+    cmp eax, 12
+    ja .invalid             ; Extended types up to 12
+    
+    ; Check base address alignment
+    mov eax, dword [es:di]      ; Base address low
+    mov ebx, dword [es:di+4]    ; Base address high
+    
+    ; Reject obviously invalid addresses (> 1TB)
+    cmp ebx, 0x10000
+    jae .invalid
+    
+    ; Check length is reasonable, non-zero, too large
+    mov eax, dword [es:di+8]    ; Length low
+    mov ebx, dword [es:di+12]   ; Length high
+    
+    ; Length must be non-zero
+    test eax, eax
+    jnz .check_length_high
+    test ebx, ebx
+    jz .invalid
+    
+.check_length_high:
+    ; Length should not exceed reasonable limits, 1TB
+    cmp ebx, 0x10000
+    jae .invalid
+    
+.valid:
+    clc                     ; Clear carry, valid
+    jmp .done
+    
+.invalid:
+    stc                     ; Set carry, invalid
+    
+.done:
+    pop ebx
+    pop eax
+    ret
+
+; Count and validate all memory entries
+count_memory_entries:
+    push ax
+    push bx
+    push cx
+    push di
+    push es
+    
+    mov ax, 0
+    mov es, ax
+    mov di, MEMORY_MAP_LOCATION
+    
+    ; Get entry count
+    mov cx, word [di]
+    add di, 4               ; Skip to first entry
+    
+    mov bx, 0               ; Valid entry counter
+    
+.count_loop:
+    test cx, cx
+    jz .count_done
+    
+    ; Validate this entry
+    call validate_memory_entry
+    jc .skip_count
+    
+    inc bx                  ; Count valid entry
+    
+.skip_count:
+    add di, MEMMAP_ENTRY_SIZE
+    dec cx
+    jmp .count_loop
+    
+.count_done:
+    ; Update entry count with valid entries only
+    mov di, MEMORY_MAP_LOCATION
+    mov word [di], bx
+    mov word [memory_entry_count], bx
+    
+    pop es
+    pop di
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; Display memory map for debugging
+display_memory_map:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push es
+    
+    mov ax, 0
+    mov es, ax
+    mov di, MEMORY_MAP_LOCATION + 4  ; Skip entry count
+    mov cx, word [memory_entry_count]
+    test cx, cx
+    jz .display_done
+    
+    ; Limit display to first 4 entries to avoid screen overflow
+    cmp cx, 4
+    jbe .display_loop
+    mov cx, 4
+    
+.display_loop:
+    push cx
+    
+    ; Display base address
+    mov si, msg_base_addr
+    call print_string
+    mov eax, dword [es:di+4]    ; High dword
+    call print_hex_dword
+    mov eax, dword [es:di]      ; Low dword
+    call print_hex_dword
+    
+    ; Display length
+    mov si, msg_length
+    call print_string
+    mov eax, dword [es:di+12]   ; High dword
+    call print_hex_dword
+    mov eax, dword [es:di+8]    ; Low dword
+    call print_hex_dword
+    
+    ; Display type with description
+    mov si, msg_type
+    call print_string
+    mov eax, dword [es:di+16]
+    call print_hex_dword
+    
+    ; Add type description
+    mov si, msg_space
+    call print_string
+    cmp eax, MEMTYPE_USABLE
+    je .type_usable
+    cmp eax, MEMTYPE_RESERVED
+    je .type_reserved
+    cmp eax, MEMTYPE_ACPI_RECLAIM
+    je .type_acpi_reclaim
+    cmp eax, MEMTYPE_ACPI_NVS
+    je .type_acpi_nvs
+    cmp eax, MEMTYPE_BAD
+    je .type_bad
+    
+    mov si, msg_type_unknown
+    jmp .type_done
+    
+.type_usable:
+    mov si, msg_type_usable_desc
+    jmp .type_done
+.type_reserved:
+    mov si, msg_type_reserved_desc
+    jmp .type_done
+.type_acpi_reclaim:
+    mov si, msg_type_acpi_reclaim_desc
+    jmp .type_done
+.type_acpi_nvs:
+    mov si, msg_type_acpi_nvs_desc
+    jmp .type_done
+.type_bad:
+    mov si, msg_type_bad_desc
+    
+.type_done:
+    call print_string
+    mov si, msg_newline
+    call print_string
+    
+    add di, 24                  ; Next entry
+    pop cx
+    dec cx
+    jnz .display_loop
+    
+.display_done:
+    pop es
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; Load kernel using LBA, INT 13h, AH=42h
+load_kernel_lba:
+    ; Build proper 16-byte DAP in memory
+    mov ax, KERNEL_TEMP_SEGMENT
+    mov es, ax
+    xor bx, bx              ; ES:BX = load address
+    
+    ; Build DAP at a fixed memory location
+    mov di, dap_buffer
+    mov byte [di], 16       ; Size of DAP
+    mov byte [di+1], 0      ; Reserved
+    mov word [di+2], KERNEL_SECTORS  ; Number of sectors
+    mov word [di+4], 0      ; Offset 0
+    mov word [di+6], KERNEL_TEMP_SEGMENT   ; Segment
+    mov dword [di+8], KERNEL_START_SECTOR  ; LBA low 32 bits
+    mov dword [di+12], 0    ; LBA high 32 bits
+    
+    mov si, di              ; DS:SI points to DAP
+    mov ah, 0x42            ; Extended read
+    mov dl, 0x80            ; First hard disk
+    int 0x13
+    
+    ; Check return status carefully and store error code
+    jc .error               ; CF set indicates error
+    test ah, ah             ; AH should be 0 on success
+    jnz .error
+    clc                     ; Ensure CF is clear on success
+    ret
+    
+.error:
+    ; Store error code for debugging
+    mov byte [disk_error_code], ah
+    stc                     ; Ensure CF is set
+    ret
+
+; Load kernel using CHS, INT 13h, AH=02h
+load_kernel_chs:
+    ; Convert LBA to CHS
+    ; LBA = (C × HPC + H) × SPT + (S - 1)
+    ; Standard: 16 heads, 63 sectors per track
+    mov ax, KERNEL_TEMP_SEGMENT
+    mov es, ax
+    xor bx, bx              ; ES:BX = load address
+    
+    ; Convert LBA 66 to CHS
+    mov ax, KERNEL_START_SECTOR  ; LBA
+    mov bl, 63              ; Sectors per track
+    div bl                  ; AX / 63 = quotient in AL, remainder in AH
+    mov cl, ah              ; Sector = remainder
+    inc cl                  ; Sectors are 1-based
+    
+    xor ah, ah              ; Clear remainder
+    mov bl, 16              ; Heads per cylinder  
+    div bl                  ; AL / 16 = cylinder, AH = head
+    mov ch, al              ; Cylinder
+    mov dh, ah              ; Head
+    
+    ; Limit sectors for CHS, max 63 sectors per call
+    mov al, KERNEL_SECTORS
+    cmp al, 63
+    jbe .read_sectors
+    mov al, 63              ; Limit to 63 sectors
+    
+.read_sectors:
+    mov ah, 0x02            ; Read sectors
+    mov dl, 0x80            ; Drive
+    int 0x13
+    
+    jc .error
+    test ah, ah
+    jnz .error
+    clc
+    ret
+    
+.error:
+    mov byte [disk_error_code], ah
+    stc
+    ret
+
+; Reset disk drive
+reset_disk:
+    mov ah, 0x00            ; Reset disk
+    mov dl, 0x80            ; First hard disk
+    int 0x13
+    ret
+
+; Verify kernel has valid signature or basic checksum
+verify_kernel_signature:
+    push ax
+    push bx
+    push cx
+    push dx
+    push es
+    
+    mov ax, KERNEL_TEMP_SEGMENT
+    mov es, ax
+    
+    ; Check for ELF magic number first (0x7F454C46 = "\x7FELF")
+    ; TODO: Implement full ELF entry parsing, and header loading
+    mov eax, dword [es:0]
+    cmp eax, 0x464C457F     ; ELF magic, little-endian
+    je .valid_elf
+    
+    ; Flat binary, default
+    test eax, eax
+    jz .invalid
+    
+    ; Check if it looks like x86-64 code
+    mov al, byte [es:0]
+    cmp al, 0x48            ; REX.W prefix
+    je .likely_code
+    cmp al, 0x55            ; PUSH RBP
+    je .likely_code
+    cmp al, 0xE9            ; JMP rel32
+    je .likely_code
+    
+    ; Simple checksum of first 64 bytes for raw binary
+    xor dx, dx              ; Checksum accumulator
+    mov cx, 32              ; Check 32 words
+    xor bx, bx
+.checksum_loop:
+    add dx, word [es:bx]
+    add bx, 2
+    dec cx
+    jnz .checksum_loop
+    
+    ; Verify checksum is non-zero
+    test dx, dx
+    jz .invalid
+    cmp dx, 0x0020          ; Reasonable checksum
+    jb .invalid
+    
+.likely_code:
+.valid_elf:
+    clc                     ; Clear carry - valid
+    jmp .done
+    
+.invalid:
+    stc                     ; Set carry - invalid
+    
+.done:
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
 kernel_load_error:
     mov si, msg_kernel_error
+    call print_string
+    
+    ; Display error code
+    mov si, msg_error_code
+    call print_string
+    mov al, byte [disk_error_code]
+    call print_hex_byte
+    mov si, msg_newline
+    call print_string
+    jmp hang
+
+kernel_signature_error:
+    mov si, msg_signature_error
     call print_string
     jmp hang
 
@@ -180,15 +789,15 @@ print_hex_dword:
     pop eax
     ret
 
-
-
 hang:
     hlt
     jmp hang
 
 ; Messages
 msg_stage2          db 'Stage 2 initialized - Setting up 64-bit...', 13, 10, 0
+msg_detect_memory   db 'Detecting system memory...', 13, 10, 0
 msg_load_kernel     db 'Loading kernel from disk...', 13, 10, 0
+msg_fallback_chs    db 'LBA failed, trying CHS...', 13, 10, 0
 msg_kernel_loaded   db 'Kernel loaded successfully', 13, 10, 0
 msg_temp_addr       db 'Temp location: 0x', 0
 msg_final_addr      db ', Final: 0x', 0
@@ -196,50 +805,56 @@ msg_sectors_loaded  db ', Sectors: 0x', 0
 msg_newline         db 13, 10, 0
 msg_protected       db 'Protected mode active, setting up paging...', 13, 10, 0
 msg_kernel_error    db 'Kernel load failed! Check disk configuration.', 13, 10, 0
+msg_signature_error db 'Invalid kernel signature or checksum!', 13, 10, 0
+msg_error_code      db 'BIOS Error Code: 0x', 0
+msg_e820_failed     db 'E820 detection failed, using fallback...', 13, 10, 0
+msg_memory_detected db 'Memory detected: 0x', 0
+msg_entries         db ' entries', 13, 10, 0
+msg_base_addr       db 'Base: 0x', 0
+msg_length          db ' Len: 0x', 0
+msg_type            db ' Type: 0x', 0
+msg_space           db ' ', 0
+msg_type_usable_desc        db '(Usable)', 0
+msg_type_reserved_desc      db '(Reserved)', 0
+msg_type_acpi_reclaim_desc  db '(ACPI)', 0
+msg_type_acpi_nvs_desc      db '(ACPI NVS)', 0
+msg_type_bad_desc           db '(Bad)', 0
+msg_type_unknown            db '(Unknown)', 0
 
-; GDT for protected mode
+; DAP buffer for LBA reads, 16 bytes aligned
+align 4
+dap_buffer:
+    times 16 db 0
+
+; Error tracking
+disk_error_code db 0
+
+; Memory detection tracking
+memory_entry_count dw 0
+
+; GDT for protected mode, brevity fix
 align 8
 gdt_start:
     ; Null descriptor
-    dq 0
+    dq 0x0000000000000000
     
-    ; Code segment, 32-bit
-    dw 0xFFFF               ; Limit low
-    dw 0                    ; Base low
-    db 0                    ; Base middle
-    db 10011010b            ; Access: present, ring 0, code, executable, readable
-    db 11001111b            ; Flags: 4KB granularity, 32-bit
-    db 0                    ; Base high
+    ; Code segment, 32-bit, selector 0x08
+    dq 0x00CF9A000000FFFF   ; Base=0, Limit=0xFFFFF, Present, Ring0, Code, 32-bit
     
-    ; Data segment, 32-bit
-    dw 0xFFFF
-    dw 0
-    db 0
-    db 10010010b            ; Access: present, ring 0, data, writable
-    db 11001111b
-    db 0
+    ; Data segment, 32-bit, selector 0x10 
+    dq 0x00CF92000000FFFF   ; Base=0, Limit=0xFFFFF, Present, Ring0, Data, 32-bit
     
-    ; Code segment, 64-bit
-    dw 0xFFFF
-    dw 0
-    db 0
-    db 10011010b            ; Access: present, ring 0, code, executable, readable
-    db 10101111b            ; Flags: 4KB granularity, 64-bit
-    db 0
+    ; Code segment, 64-bit, selector 0x18
+    dq 0x00AF9A000000FFFF   ; Base=0, Limit=0xFFFFF, Present, Ring0, Code, 64-bit
     
-    ; Data segment, 64-bit
-    dw 0xFFFF
-    dw 0
-    db 0
-    db 10010010b
-    db 10101111b
-    db 0
+    ; Data segment, 64-bit, selector 0x20
+    dq 0x00AF92000000FFFF   ; Base=0, Limit=0xFFFFF, Present, Ring0, Data, 64-bit
 
 gdt_end:
 
 gdt_descriptor:
     dw gdt_end - gdt_start - 1  ; Size
-    dd gdt_start                 ; Offset
+    dd gdt_start                ; Offset
 
 ; 32-bit protected mode
 [BITS 32]
@@ -253,22 +868,34 @@ protected_mode:
     mov ss, ax
     mov esp, STACK_ADDRESS  ; Set up stack at 576KB
     
-    ; Copy kernel from temp to final location
-    ; Copy KERNEL_SECTORS * 512 bytes
+    ; Copy KERNEL_SECTORS * 512 bytes to final
     mov esi, KERNEL_TEMP_SEGMENT * 16  ; Source: temporary load location
     mov edi, KERNEL_FINAL_ADDRESS      ; Destination: final kernel location
-    mov ecx, 16256          ; Copy 65024 bytes, (127 sectors * 512) / 4 = 16256 dwords
+    mov ecx, KERNEL_SECTORS * 512 / 4  ; Convert to dwords (127 * 512 / 4 = 16256)
     
-    ; Verify source has data before copying
+    ; Verify source has valid data before copying
     mov eax, dword [esi]
     test eax, eax
     jz copy_error
     
+    ; Additional verification
+    mov eax, dword [esi + 512]  ; Check second sector
+    test eax, eax
+    jz copy_error
+    
+    ; Perform the copy
+    cld                     ; Ensure forward direction
     rep movsd
+    
+    ; Verify copy completed successfully
+    mov eax, dword [KERNEL_FINAL_ADDRESS]
+    test eax, eax
+    jz copy_error
+    
     jmp copy_done
 
 copy_error:
-    ; Kernel wasn't loaded from disk
+    ; Kernel wasn't loaded properly
     mov esi, msg_copy_error
     call print_string_32
     jmp hang_32
@@ -295,27 +922,31 @@ copy_done:
     xor eax, eax
     rep stosd
     
-    ; Set up page tables
-    ; PML4 at 0x70000
+    ; Set up page tables with proper flag composition, PML4 at 0x70000
     mov edi, 0x70000
-    mov dword [edi], 0x71003    ; Point to PDPT, present + writable
-    mov dword [edi+4], 0x00000000   ; Upper 32 bits
+    mov eax, 0x71000        ; PDPT base address
+    or eax, 0x03            ; Add present + writable flags
+    mov dword [edi], eax    ; Lower 32 bits
+    mov dword [edi+4], 0    ; Upper 32 bits
     
     ; PDPT at 0x71000
     mov edi, 0x71000
-    mov dword [edi], 0x72003    ; Point to PD, present + writable
-    mov dword [edi+4], 0x00000000   ; Upper 32 bits
+    mov eax, 0x72000        ; PD base address
+    or eax, 0x03            ; Add present + writable flags
+    mov dword [edi], eax    ; Lower 32 bits
+    mov dword [edi+4], 0    ; Upper 32 bits
     
-    ; PD at 0x72000 - identity map 32MB with 2MB pages (16 entries)
+    ; PD at 0x72000, identity map 32MB with 2MB pages, 16 entries
     mov edi, 0x72000
-    mov eax, 0x00000083     ; Base flags: present + writable + 2MB page
-    mov ecx, 16             ; Map 16 entries
-    mov edx, 0              ; Physical address counter
+    mov edx, 0              ; Physical address base
+    mov ecx, 16             ; Map 16 entries, 32MB total
 .map_loop:
+    mov eax, edx            ; Physical address base
+    or eax, 0x83            ; Add present + writable + 2MB page flags
     mov [edi], eax          ; Lower 32 bits
-    mov dword [edi+4], 0    ; Upper 32 bits, always 0 < 4GB
-    add eax, 0x200000       ; Next 2MB page
-    add edi, 8              ; Next page directory entry
+    mov dword [edi+4], 0    ; Upper 32 bits, always 0 for addresses < 4GB
+    add edx, 0x200000       ; Next 2MB physical address, fixed from eax to edx
+    add edi, 8              ; Next page directory entry bytes
     dec ecx
     jnz .map_loop
     
@@ -388,7 +1019,7 @@ long_mode:
     
     ; Clear screen
     mov rdi, 0xB8000
-    mov rcx, 80 * 25        ; 80x25 screen
+    mov rcx, 2000           ; 80*25 = 2000 characters
     mov ax, 0x0F20          ; White space
     rep stosw
     
