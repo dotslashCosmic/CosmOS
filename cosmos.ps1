@@ -153,7 +153,7 @@ function Find-Tool($toolName, $commonPaths = @()) {
 }
 
 function Build-CosmOS {
-    Write-Header "=== Building CosmosBoot Custom Bootloader ==="
+    Write-Header "=== Building CosmosBootloader ==="
     Write-Host ""
     
     # File paths
@@ -406,4 +406,5 @@ switch ($Command) {
     "clean" { Clean-Build }
     "help" { Show-Help }
     default { Show-Help }
+
 }
