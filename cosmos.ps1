@@ -202,13 +202,11 @@ function Build-CosmOS {
     
     # Build kernel
     Write-Success "[3/5] Building kernel..."
-    $env:RUSTFLAGS = "-C link-arg=-Tkernel/linker.ld"
     cargo build --package cosmos --target x86_64-unknown-none --$Mode
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Kernel build failed"
         exit 1
     }
-    $env:RUSTFLAGS = ""
     
     if (-not (Test-Path $kernelElf)) {
         Write-Error "Kernel binary not found at $kernelElf"
