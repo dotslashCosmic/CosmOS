@@ -1,12 +1,12 @@
 [package]
-name = "cosmos-boot"
+name = "cosmosbootloader"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "cosmos-boot"
+name = "cosmosbootloader"
 path = "src/main.rs"
 
 [dependencies]
