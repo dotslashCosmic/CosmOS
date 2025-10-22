@@ -145,23 +145,61 @@ print_hex_byte:
     pop ax
     ret
 
-; Enable A20 line, rewrite to be robust, keyboard controller-ports 0x60/0x64
+; Enable A20 line
 enable_a20:
     push ax
-    
-    ; Try fast A20 gate
-    in al, 0x92
-    or al, 2
-    out 0x92, al
-    
-    ; Wait
-    mov cx, 0xFFFF
-.wait:
-    loop .wait
-    
-    pop ax
+    push dx
+
+    ; Try A20
+    in   al, 0x92
+    test al, 2
+    jnz  .done_fast          ; Already enabled
+    or   al, 2
+    and  al, 0xFE            ; Make sure bit 0 (reset) stays 0
+    out  0x92, al
+    in   al, 0x92
+    test al, 2
+    jnz  .done_fast          ; Success
+
+    ; 8042 keyboard controller method fallback
+    call .wait_input
+    mov  al, 0xAD
+    out  0x64, al            ; Disable keyboard
+
+    call .wait_input
+    mov  al, 0xD0
+    out  0x64, al            ; Read output port
+    call .wait_output
+    in   al, 0x60
+    or   al, 2               ; Set A20 enable bit
+    call .wait_input
+    mov  ah, al
+    mov  al, 0xD1
+    out  0x64, al
+    call .wait_input
+    mov  al, ah
+    out  0x60, al
+
+    call .wait_input
+    mov  al, 0xAE
+    out  0x64, al            ; Re-enable keyboard
+
+.done_fast:
+    pop  dx
+    pop  ax
     ret
 
+.wait_input:                 ; Wait for input buffer empty
+    in   al, 0x64
+    test al, 2
+    jnz  .wait_input
+    ret
+
+.wait_output:                ; Wait for output buffer full
+    in   al, 0x64
+    test al, 1
+    jz   .wait_output
+    ret
 
 
 hang:
