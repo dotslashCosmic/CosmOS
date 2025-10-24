@@ -9,5 +9,19 @@ license.workspace = true
 name = "cosmosbootloader"
 path = "src/main.rs"
 
+[[bin]]
+name = "cosmosbootloader-uefi"
+path = "src/uefi_main.rs"
+
 [dependencies]
-# None, CosmosBootloader is built using NASM
+# None, pure Assembly and Rust
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"  # Optimize for size
+lto = true
+strip = true
+codegen-units = 1
