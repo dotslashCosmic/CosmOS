@@ -5,9 +5,9 @@ CosmOS (Custom Open-Source Modular Operating System) is a fully custom kernel an
 ## Architecture
 
 - Target: x86_64 bare-metal (`x86_64-unknown-none`)
-- Language: Rust (nightly toolchain, edition 2021)
+- Language: Rust (10-20-2025 nightly toolchain, Rust edition 2021)
 - Boot: Custom two-stage bootloader with BIOS/UEFI support
-- Environment: `#![no_std]` with selective `alloc` usage
+- Environment: Strict `#![no_std]` with selective `alloc` usage
 - Security & memory safety:
   - Hardware-enforced privilege separation (Ring 0 / Ring 3)
   - Rust ownership model to reduce buffer overflows and use-after-free
@@ -18,7 +18,7 @@ CosmOS (Custom Open-Source Modular Operating System) is a fully custom kernel an
 - Rust (nightly)
 - NASM assembler
 - QEMU or VirtualBox (for testing)
-- On Windows, the setup may use winget (PowerShell) for installing tools
+- On Windows, `just` uses winget (PowerShell) for setup and execution.
 
 ## Quick start
 
@@ -31,6 +31,7 @@ just
 just setup
 just build
 just run-qemu   # QEMU
+just run-uefi-qemu # QEMU UEFI Mode
 # or
 just run-vbox   # VirtualBox
 ```
@@ -41,7 +42,8 @@ just run-vbox   # VirtualBox
 2. Stage 2: Extended bootloader (sectors 1–64, ~32 KB)  
 3. Kernel: Flat binary loaded at sector 66+
 
-The bootloader creates a 64 MB disk image with the kernel embedded, avoiding a separate filesystem for initial boot.
+The BIOS bootloader creates a 64 MB disk image with the kernel embedded, avoiding a separate filesystem for initial boot.
+UEFI creates a .EFI image.
 
 ## Development
 
