@@ -1,7 +1,7 @@
 # CosmOS Development Script
 param(
     [Parameter(Position=0)]
-    [ValidateSet("setup", "build", "run-qemu", "run-vbox", "create-vdi", "update-vm", "clean", "help")]
+    [ValidateSet("setup", "build", "build-uefi", "create-uefi-image", "run-qemu", "run-uefi-qemu", "run-vbox", "create-vdi", "update-vm", "clean", "help")]
     [string]$Command = "help",
     
     [ValidateSet("debug", "release")]
@@ -31,23 +31,26 @@ function Show-Help {
     Write-Host "Usage: .\cosmos.ps1 <command> [options]"
     Write-Host ""
     Write-Host "Commands:"
-    Write-Host "  setup       Install development dependencies"
-    Write-Host "  build       Build the kernel and bootloader"
-    Write-Host "  run-qemu    Build and run in QEMU"
-    Write-Host "  run-vbox    Build and run in VirtualBox"
-    Write-Host "  create-vdi  Convert bootimage to VirtualBox VDI"
-    Write-Host "  update-vm   Quick update and restart VirtualBox VM"
-    Write-Host "  clean       Clean build artifacts"
-    Write-Host "  help        Show this help"
+    Write-Host "  setup              Install development dependencies"
+    Write-Host "  build              Build kernel and BIOS bootloader"
+    Write-Host "  build-uefi         Build UEFI bootloader"
+    Write-Host "  create-uefi-image  Create UEFI disk image"
+    Write-Host "  run-qemu           Run in QEMU (BIOS mode)"
+    Write-Host "  run-uefi-qemu      Run in QEMU (UEFI mode)"
+    Write-Host "  run-vbox           Run in VirtualBox"
+    Write-Host "  create-vdi         Create VirtualBox VDI"
+    Write-Host "  update-vm          Update and restart VM"
+    Write-Host "  clean              Clean build artifacts"
+    Write-Host "  help               Show this help"
     Write-Host ""
     Write-Host "Options:"
     Write-Host "  -Mode <debug|release>  Build mode (default: release)"
     Write-Host "  -Force                 Force reinstall dependencies"
     Write-Host ""
     Write-Host "Examples:"
-    Write-Host "  .\cosmos.ps1 setup"
-    Write-Host "  .\cosmos.ps1 build -Mode debug"
     Write-Host "  .\cosmos.ps1 run-qemu"
+    Write-Host "  .\cosmos.ps1 run-uefi-qemu"
+    Write-Host "  .\cosmos.ps1 build -Mode debug"
 }
 
 function Install-Dependencies {
@@ -150,6 +153,174 @@ function Find-Tool($toolName, $commonPaths = @()) {
     }
     
     return $null
+}
+
+function Build-UEFIBootloader {
+    Write-Header "=== Building UEFI Bootloader ==="
+    Write-Host ""
+    
+    # File paths (UEFI target uses different directory)
+    $uefiTargetDir = "target\x86_64-unknown-uefi\$Mode"
+    $uefiBootloaderBin = "$uefiTargetDir\cosmosbootloader-uefi.efi"
+    $uefiBootloaderEfi = "$script:TargetDir\BOOTX64.EFI"
+    
+    # Build UEFI bootloader
+    Write-Success "[1/2] Building UEFI bootloader..."
+    
+    rustup target add x86_64-unknown-uefi | Out-Null
+    
+    if ($Mode -eq "release") {
+        cargo build --package cosmosbootloader --bin cosmosbootloader-uefi --target x86_64-unknown-uefi --release
+    } else {
+        cargo build --package cosmosbootloader --bin cosmosbootloader-uefi --target x86_64-unknown-uefi
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "UEFI bootloader build failed"
+        exit 1
+    }
+    
+    if (-not (Test-Path $uefiBootloaderBin)) {
+        Write-Error "UEFI bootloader binary not found at $uefiBootloaderBin"
+        exit 1
+    }
+    $bootloaderSize = (Get-Item $uefiBootloaderBin).Length
+    Write-Detail "  [OK] UEFI Bootloader: $uefiBootloaderBin ($bootloaderSize bytes)"
+    
+    # Copy to standard location
+    Write-Success "[2/2] Creating BOOTX64.EFI..."
+    
+    # Ensure target directory exists
+    $targetDir = Split-Path $uefiBootloaderEfi -Parent
+    if (-not (Test-Path $targetDir)) {
+        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+    }
+    
+    Copy-Item $uefiBootloaderBin $uefiBootloaderEfi -Force
+    
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Failed to convert bootloader to PE/COFF format"
+        exit 1
+    }
+    
+    $efiSize = (Get-Item $uefiBootloaderEfi).Length
+    Write-Detail "  [OK] BOOTX64.EFI: $uefiBootloaderEfi ($efiSize bytes)"
+    
+    Write-Host ""
+    Write-Success "=== UEFI Bootloader Build Complete ==="
+    Write-Info "Output: $uefiBootloaderEfi"
+    Write-Host ""
+    
+    return $uefiBootloaderEfi
+}
+
+function Create-UEFI-Image {
+    Write-Header "=== Creating UEFI Disk Image ==="
+    Write-Host ""
+    
+    # Build UEFI bootloader first
+    $bootloaderEfi = Build-UEFIBootloader
+    
+    # Build kernel
+    Write-Success "[1/3] Building kernel..."
+    $kernelElf = "$script:TargetDir\cosmos"
+    $kernelBin = "$script:TargetDir\kernel.bin"
+    
+    if ($Mode -eq "release") {
+        cargo build --package cosmos --target x86_64-unknown-none --release
+    } else {
+        cargo build --package cosmos --target x86_64-unknown-none
+    }
+    
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Kernel build failed"
+        exit 1
+    }
+    
+    if (-not (Test-Path $kernelElf)) {
+        Write-Error "Kernel ELF not found at $kernelElf"
+        exit 1
+    }
+    Write-Detail "  [OK] Kernel ELF: $kernelElf"
+    
+    # Convert kernel to flat binary
+    Write-Success "[2/3] Converting kernel to flat binary..."
+    
+    $rustToolchainPath = "$env:USERPROFILE\.rustup\toolchains\nightly-x86_64-pc-windows-msvc\lib\rustlib\x86_64-pc-windows-msvc\bin\llvm-objcopy.exe"
+    $objcopy = Find-Tool "llvm-objcopy" @($rustToolchainPath)
+    if (-not $objcopy) {
+        Write-Error "llvm-objcopy not found! Install with: rustup component add llvm-tools-preview"
+        exit 1
+    }
+    
+    & $objcopy -O binary $kernelElf $kernelBin
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Kernel conversion failed"
+        exit 1
+    }
+    Write-Detail "  [OK] Kernel binary: $kernelBin"
+    
+    # Create UEFI ESP directory
+    Write-Success "[3/3] Creating UEFI ESP directory..."
+    $espDir = "$script:TargetDir\esp"
+    
+    if (Test-Path $espDir) {
+        Remove-Item -Recurse -Force $espDir
+    }
+    New-Item -ItemType Directory -Path "$espDir\EFI\BOOT" -Force | Out-Null
+    
+    # Copy bootloader
+    Copy-Item $bootloaderEfi "$espDir\EFI\BOOT\BOOTX64.EFI" -Force
+    Write-Detail "  [OK] Copied BOOTX64.EFI"
+    
+    # Copy kernel
+    Copy-Item $kernelBin "$espDir\kernel.bin" -Force
+    Write-Detail "  [OK] Copied kernel.bin"
+    
+    Write-Host ""
+    Write-Success "=== UEFI Disk Image Created ==="
+    Write-Host ""
+    
+    return $espDir
+}
+
+function Run-UEFI-QEMU {
+    $espDir = Create-UEFI-Image
+    
+    Write-Host ""
+    Write-Success "Starting QEMU with OVMF..."
+    
+    $qemu = Find-Tool "qemu-system-x86_64" @("C:\Program Files\qemu\qemu-system-x86_64.exe")
+    if (-not $qemu) {
+        Write-Error "QEMU not found! Run setup first: .\cosmos.ps1 setup"
+        exit 1
+    }
+    
+    $ovmfPaths = @(
+        "C:\Program Files\qemu\share\edk2-x86_64-code.fd",
+        "C:\Program Files\qemu\share\OVMF_CODE.fd",
+        "$env:ProgramFiles\qemu\share\edk2-x86_64-code.fd",
+        "$env:ProgramFiles\qemu\share\OVMF_CODE.fd"
+    )
+    
+    $ovmf = $null
+    foreach ($path in $ovmfPaths) {
+        if (Test-Path $path) {
+            $ovmf = $path
+            break
+        }
+    }
+    
+    if (-not $ovmf) {
+        Write-Error "OVMF firmware not found! Please install QEMU with UEFI support."
+        exit 1
+    }
+    
+    # Run with GUI window and serial output
+    & $qemu `
+        -drive "if=pflash,format=raw,readonly=on,file=$ovmf" `
+        -drive "file=fat:rw:$espDir,format=raw" `
+        -serial stdio `
+        -m 256M
 }
 
 function Build-CosmOS {
@@ -397,7 +568,10 @@ function Clean-Build {
 switch ($Command) {
     "setup" { Install-Dependencies }
     "build" { Build-CosmOS }
+    "build-uefi" { Build-UEFIBootloader }
+    "create-uefi-image" { Create-UEFI-Image }
     "run-qemu" { Run-QEMU }
+    "run-uefi-qemu" { Run-UEFI-QEMU }
     "run-vbox" { Run-VirtualBox }
     "create-vdi" { Create-VDI }
     "update-vm" { Update-VM }
