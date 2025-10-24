@@ -4,114 +4,229 @@
 //! CosmOS Kernel Entry Point
 
 use cosmos::mm::MemoryMap;
+
+/// Simple serial port writer for COM1 (0x3F8)
+struct SerialPort {
+    base: u16,
+}
+
+impl SerialPort {
+    const fn new(base: u16) -> Self {
+        SerialPort { base }
+    }
+    
+    fn init(&self) {
+        unsafe {
+            // Disable interrupts
+            Self::outb(self.base + 1, 0x00);
+            // Enable DLAB (set baud rate divisor)
+            Self::outb(self.base + 3, 0x80);
+            // Set divisor to 3 (38400 baud)
+            Self::outb(self.base + 0, 0x03);
+            Self::outb(self.base + 1, 0x00);
+            // 8 bits, no parity, one stop bit
+            Self::outb(self.base + 3, 0x03);
+            // Enable FIFO, clear them, with 14-byte threshold
+            Self::outb(self.base + 2, 0xC7);
+            // IRQs enabled, RTS/DSR set
+            Self::outb(self.base + 4, 0x0B);
+        }
+    }
+    
+    fn write_byte(&self, byte: u8) {
+        unsafe {
+            // Wait for transmit buffer to be empty
+            while (Self::inb(self.base + 5) & 0x20) == 0 {}
+            Self::outb(self.base, byte);
+        }
+    }
+    
+    fn write_str(&self, s: &str) {
+        for byte in s.bytes() {
+            if byte == b'\n' {
+                self.write_byte(b'\r'); // Add carriage return for proper line breaks
+            }
+            self.write_byte(byte);
+        }
+    }
+    
+    unsafe fn outb(port: u16, value: u8) {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") port,
+            in("al") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    
+    unsafe fn inb(port: u16) -> u8 {
+        let value: u8;
+        core::arch::asm!(
+            "in al, dx",
+            out("al") value,
+            in("dx") port,
+            options(nomem, nostack, preserves_flags)
+        );
+        value
+    }
+}
+
+static SERIAL: SerialPort = SerialPort::new(0x3F8);
+
+/// Dual output writer - writes to both VGA and Serial
+struct DualWriter {
+    vga_buffer: *mut u16,
+    column: usize,
+    row: usize,
+}
+
+impl DualWriter {
+    const BUFFER_WIDTH: usize = 80;
+    const BUFFER_HEIGHT: usize = 25;
+    
+    const fn new() -> Self {
+        DualWriter {
+            vga_buffer: 0xb8000 as *mut u16,
+            column: 0,
+            row: 0,
+        }
+    }
+    
+    fn write_byte(&mut self, byte: u8, color: u16) {
+        unsafe {
+            match byte {
+                b'\n' => {
+                    // Newline - move to next line
+                    self.column = 0;
+                    self.row += 1;
+                    if self.row >= Self::BUFFER_HEIGHT {
+                        self.row = Self::BUFFER_HEIGHT - 1;
+                    }
+                    // Also write to serial
+                    SERIAL.write_byte(b'\n');
+                }
+                byte => {
+                    // Write to VGA
+                    if self.column < Self::BUFFER_WIDTH && self.row < Self::BUFFER_HEIGHT {
+                        let offset = self.row * Self::BUFFER_WIDTH + self.column;
+                        *self.vga_buffer.add(offset) = color | byte as u16;
+                    }
+                    self.column += 1;
+                    if self.column >= Self::BUFFER_WIDTH {
+                        self.column = 0;
+                        self.row += 1;
+                        if self.row >= Self::BUFFER_HEIGHT {
+                            self.row = Self::BUFFER_HEIGHT - 1;
+                        }
+                    }
+                    // Also write to serial
+                    SERIAL.write_byte(byte);
+                }
+            }
+        }
+    }
+    
+    fn write_line(&mut self, text: &[u8], color: u16) {
+        for &byte in text {
+            if byte != 0 {
+                self.write_byte(byte, color);
+            }
+        }
+        self.write_byte(b'\n', color);
+    }
+    
+    fn clear_screen(&mut self) {
+        unsafe {
+            for i in 0..(Self::BUFFER_WIDTH * Self::BUFFER_HEIGHT) {
+                *self.vga_buffer.add(i) = 0x0F20; // White space on black
+            }
+        }
+        self.column = 0;
+        self.row = 0;
+    }
+}
+
+static mut WRITER: DualWriter = DualWriter::new();
+
 #[no_mangle]
 #[link_section = ".rodata.signature"]
 static KERNEL_SIGNATURE: u32 = 0xC05305; // "CosmOS"
 #[no_mangle]
 #[link_section = ".text._start"]
 pub extern "C" fn _start() -> ! {
-    // Write directly to VGA buffer
+    // Initialize serial port FIRST - before anything else
+    SERIAL.init();
+    
     unsafe {
-        let vga_buffer = 0xb8000 as *mut u16;
+        // Clear screen (VGA + Serial header)
+        WRITER.clear_screen();
         
-        // Clear screen with black background
-        const BUFFER_WIDTH: usize = 80;
-        const BUFFER_HEIGHT: usize = 25;
-        const BUFFER_SIZE: usize = BUFFER_WIDTH * BUFFER_HEIGHT;
-        
-        for i in 0..BUFFER_SIZE {
-            *vga_buffer.add(i) = 0x0F20; // White space on black
+        // Write title in green (0x0B00)
+        let message = b"CosmOS Kernel v0.0.3";
+        for &byte in message {
+            WRITER.write_byte(byte, 0x0B00);
         }
+        WRITER.write_byte(b'\n', 0x0F00);
         
-        // Write "CosmOS Kernel v0.0.2" in green
-        let message = b"CosmOS Kernel v0.0.2";
-        for (i, &byte) in message.iter().enumerate() {
-            *vga_buffer.add(i) = 0x0B00 | byte as u16;
-        }
-        
-        let mut current_line = 1;
-        
-        // Helper function to write a line of text
-        let write_line = |text: &[u8], color: u16, line_num: &mut usize| {
-            for (i, &byte) in text.iter().enumerate() {
-                if i < BUFFER_WIDTH && *line_num < BUFFER_HEIGHT {
-                    *vga_buffer.add(*line_num * BUFFER_WIDTH + i) = color | byte as u16;
-                }
-            }
-            *line_num += 1;
-        };
-
         // Test memory management
         match MemoryMap::from_bootloader() {
             Ok(_memory_map) => {
-                write_line(b"Memory map parsed successfully!", 0x0A00, &mut current_line);
+                WRITER.write_line(b"Bootloader memory map parsed successfully!", 0x0A00);
             }
             Err(_) => {
                 let _fallback_map = MemoryMap::create_fallback();
+                WRITER.write_line(b"Memory map parsed successfully!", 0x0A00);
             }
         }
         
-        write_line(b"Memory Management Module loaded.", 0x0A00, &mut current_line);
+        // Detect boot mode by checking BIOS data area
+        let bios_equipment_ptr = 0x400 as *const u16;
+        let bios_equipment = *bios_equipment_ptr;
         
-        // Test memory regions
-        let memory_regions = [
-            (0x0, "Bootloader Entry"),
-            (0x400, "BIOS Equipment"),
-            (0x413, "Base Memory KB"),
-            (0x417, "Keyboard Flags"),
-            (0x41A, "Keyboard Buffer"),
-            (0x46C, "Timer Ticks"),
-            (0x475, "Hard Disk Count"),
-            (0x500, "BIOS Data"),
-            (0x7C00, "Boot Sector"),
-            (0x7DFE, "Boot Signature"),
-            (0x8000, "Stage2 Start"),
-            (0x9000, "Memory Entries"),
-            (0x10000, "Kernel Copy"),
-            (0x9FC00, "Low Memory End"),
-            (vga_buffer as usize, "VGA Buffer"),
-        ];
-        
-        for (addr, desc) in memory_regions.iter() {
-            // Read tests
-            let ptr = *addr as *const u32;
-            let value = *ptr;
-            
-            // Format output line
-            let mut msg = [b' '; 80];
-            
-            // Copy description (limit to 20 chars)
-            for (i, &b) in desc.as_bytes().iter().enumerate() {
-                if i < 20 {
-                    msg[i] = b;
-                }
-            }
-            
-            // Add address at position 22
-            msg[22] = b'0';
-            msg[23] = b'x';
-            
-            // Convert address to hex, 6 digits
-            let hex_chars = b"0123456789ABCDEF";
-            for i in 0..6 {
-                let nibble = ((*addr >> (20 - i * 4)) & 0xF) as usize;
-                msg[24 + i] = hex_chars[nibble];
-            }
-            
-            // Add value at position 32
-            msg[32] = b'=';
-            msg[33] = b'0';
-            msg[34] = b'x';
-            
-            // Show first 4 hex digits of value
-            for i in 0..4 {
-                let nibble = ((value >> (12 - i * 4)) & 0xF) as usize;
-                msg[35 + i] = hex_chars[nibble];
-            }
-            
-            write_line(&msg[..50], 0x0F00, &mut current_line);
-        }
+        let boot_mode = if bios_equipment == 0 {
+            b"Boot Mode: UEFI"
+        } else {
+            b"Boot Mode: BIOS"
+        };
+        WRITER.write_line(boot_mode, 0x0E00); // Yellow
 
+        // BIOS uses VGA, UEFI uses Serial
+        if bios_equipment == 0 {
+            WRITER.write_line(b"Output Mode: Serial", 0x0E00);
+        } else {
+            WRITER.write_line(b"Output Mode: VGA", 0x0E00);
+        }
+        
+        // Show E820 entry count
+        let e820_count_ptr = 0x9000 as *const u32;
+        let e820_count = *e820_count_ptr;
+        
+        let mut msg = [b' '; 80];
+        let prefix = b"E820 Entries: ";
+        for (i, &b) in prefix.iter().enumerate() {
+            msg[i] = b;
+        }
+        let mut pos = prefix.len();
+        
+        // Convert count to decimal
+        if e820_count == 0 {
+            msg[pos] = b'0';
+            pos += 1;
+        } else {
+            let mut temp = e820_count;
+            let mut digits = [0u8; 10];
+            let mut digit_count = 0;
+            while temp > 0 {
+                digits[digit_count] = (temp % 10) as u8 + b'0';
+                temp /= 10;
+                digit_count += 1;
+            }
+            for i in 0..digit_count {
+                msg[pos] = digits[digit_count - 1 - i];
+                pos += 1;
+            }
+        }
+        WRITER.write_line(&msg[..pos], 0x0E00);
         
         let kernel_addrs = [
             (_start as *const () as usize, "Kernel Entry"),
@@ -156,11 +271,12 @@ pub extern "C" fn _start() -> ! {
                 msg[35 + i] = hex_chars[nibble];
             }
             
-            write_line(&msg[..40], 0x0E00, &mut current_line);
+            WRITER.write_line(&msg[..40], 0x0E00);
         }
         
         // Final status
-        write_line(b"HALTING SAFELY...", 0x0A00, &mut current_line);
+        WRITER.write_line(b"Kernel initialization complete.", 0x0A00);
+        WRITER.write_line(b"HALTING SAFELY...", 0x0A00);
     }
     
     // Infinite halt loop
@@ -177,19 +293,7 @@ where
     F: Fn(&[u8], u16, &mut usize)
 {
     let memory_regions = [
-        (0x400, "BIOS Equipment"),
-        (0x413, "Base Memory KB"),
-        (0x417, "Keyboard Flags"),
-        (0x41A, "Keyboard Buffer"),
-        (0x46C, "Timer Ticks"),
-        (0x475, "Hard Disk Count"),
-        (0x500, "BIOS Data"),
-        (0x7C00, "Boot Sector 1"),
-        (0x7DFE, "Boot Signature"),
-        (0x8000, "Boot Sector 2"),
         (0x9000, "Memory Entries"),
-        (0x10000, "Kernel Copy"),
-        (0x9FC00, "Memory End"),
         (0xB8000, "VGA Buffer"),
     ];
     
@@ -289,8 +393,37 @@ where
 
 /// Panic handler for the kernel
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // Write panic message directly to VGA
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Write panic message to serial (works in both BIOS and UEFI)
+    SERIAL.write_str("\n!!! KERNEL PANIC !!!\n");
+    if let Some(location) = info.location() {
+        SERIAL.write_str("Location: ");
+        SERIAL.write_str(location.file());
+        SERIAL.write_str(":");
+        // Simple number to string conversion
+        let line = location.line();
+        let mut buf = [0u8; 10];
+        let mut n = line;
+        let mut i = 0;
+        if n == 0 {
+            buf[0] = b'0';
+            i = 1;
+        } else {
+            while n > 0 {
+                buf[i] = (n % 10) as u8 + b'0';
+                n /= 10;
+                i += 1;
+            }
+        }
+        // Reverse the digits
+        for j in 0..i/2 {
+            buf.swap(j, i - 1 - j);
+        }
+        SERIAL.write_str(core::str::from_utf8(&buf[..i]).unwrap_or("?"));
+        SERIAL.write_str("\n");
+    }
+    
+    // Also write to VGA if available (BIOS mode)
     unsafe {
         const BUFFER_WIDTH: usize = 80;
         let vga_buffer = 0xb8000 as *mut u16;
