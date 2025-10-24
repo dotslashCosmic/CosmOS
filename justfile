@@ -1,59 +1,56 @@
 # CosmOS Build System
 set shell := ["powershell.exe", "-c"]
 
-# Default: build and run
-default: build run-qemu
+# Default: build and run in QEMU (BIOS)
+default: run-qemu
 
-# Setup Rust + nightly toolchain, Chocolatey, NASM
+# Setup development environment
 setup:
     powershell -ExecutionPolicy Bypass -File cosmos.ps1 setup
 
-# Build kernel, release
+# Build BIOS bootloader and kernel
 build:
     powershell -ExecutionPolicy Bypass -File cosmos.ps1 build
 
-# Build kernel, debug
+# Build in debug mode
 build-debug:
     powershell -ExecutionPolicy Bypass -File cosmos.ps1 build -Mode debug
 
-# Build just the kernel ELF, no bootloader or disk image
-build-kernel:
-    @Write-Host "Building kernel ELF only..." -ForegroundColor Cyan
-    $env:RUSTFLAGS = "-C link-arg=-Tkernel/linker.ld"
-    cargo build --package cosmos --target x86_64-unknown-none --release
-    $env:RUSTFLAGS = ""
-    @Write-Host "Kernel ELF: target/x86_64-unknown-none/release/cosmos" -ForegroundColor Green
+# Build UEFI bootloader
+build-uefi:
+    powershell -ExecutionPolicy Bypass -File cosmos.ps1 build-uefi
 
-# Build just the kernel ELF, debug mode
-build-kernel-debug:
-    @Write-Host "Building kernel ELF (debug) only..." -ForegroundColor Cyan
-    $env:RUSTFLAGS = "-C link-arg=-Tkernel/linker.ld"
-    cargo build --package cosmos --target x86_64-unknown-none --debug
-    $env:RUSTFLAGS = ""
-    @Write-Host "Kernel ELF: target/x86_64-unknown-none/debug/cosmos" -ForegroundColor Green
+# Build UEFI bootloader in debug mode
+build-uefi-debug:
+    powershell -ExecutionPolicy Bypass -File cosmos.ps1 build-uefi -Mode debug
 
-# Clean and rebuild
-rebuild: 
-    cargo clean
-    powershell -ExecutionPolicy Bypass -File cosmos.ps1 clean
-    powershell -ExecutionPolicy Bypass -File cosmos.ps1 build
-
-# Run in QEMU
+# Run in QEMU (BIOS mode)
 run-qemu: 
     powershell -ExecutionPolicy Bypass -File cosmos.ps1 run-qemu
 
-# Run in VirtualBox
+# Run in QEMU (UEFI mode)
+run-uefi-qemu:
+    powershell -ExecutionPolicy Bypass -File cosmos.ps1 run-uefi-qemu
+
+# Run in VirtualBox (BIOS mode)
 run-vbox:
     powershell -ExecutionPolicy Bypass -File cosmos.ps1 run-vbox
 
-# Create VirtualBox VDI disk
+# Create UEFI disk image
+create-uefi-image:
+    powershell -ExecutionPolicy Bypass -File cosmos.ps1 create-uefi-image
+
+# Create VirtualBox VDI
 create-vdi:
     powershell -ExecutionPolicy Bypass -File cosmos.ps1 create-vdi
 
-# Update and restart VirtualBox VM
+# Update and restart VM
 update-vm:
     powershell -ExecutionPolicy Bypass -File cosmos.ps1 update-vm
 
 # Clean build artifacts
 clean:
     powershell -ExecutionPolicy Bypass -File cosmos.ps1 clean
+
+# Clean and rebuild
+rebuild: clean build
