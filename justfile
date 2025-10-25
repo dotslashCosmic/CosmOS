@@ -54,3 +54,7 @@ clean:
 
 # Clean and rebuild
 rebuild: clean build
+
+# Build release artifacts (BIOS image, UEFI bootloader, kernel binary, and ELF)
+release:
+    powershell -ExecutionPolicy Bypass -File cosmos.ps1 release
