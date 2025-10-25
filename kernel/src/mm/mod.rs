@@ -3,6 +3,7 @@
 pub mod memory_map;
 pub mod frame_allocator;
 pub mod heap;
+pub mod paging;
 
 // Re-export core types
 pub use memory_map::{MemoryMap, MemoryMapEntry, MemoryType, MemoryMapError};
