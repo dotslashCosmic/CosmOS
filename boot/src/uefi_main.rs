@@ -85,7 +85,7 @@ pub extern "efiapi" fn efi_main(
         );
         
         // Setup page tables for long mode
-        memory_setup::setup_page_tables(console);
+        memory_setup::setup_page_tables(console, memory_info.descriptor_size, memory_info.descriptor_count);
         
         // Exit boot services, switch page tables atomically at the same time
         println!(console, "Exiting boot services and loading page tables...");
