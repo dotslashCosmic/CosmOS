@@ -320,7 +320,7 @@ function Run-UEFI-QEMU {
         -drive "if=pflash,format=raw,readonly=on,file=$ovmf" `
         -drive "file=fat:rw:$espDir,format=raw" `
         -serial stdio `
-        -m 256M
+        -m 1024M
 }
 
 function Build-CosmOS {
@@ -470,7 +470,7 @@ function Run-QEMU {
         exit 1
     }
     
-    & $qemu -drive format=raw,file=$bootImage -serial stdio
+    & $qemu -drive format=raw,file=$bootImage -serial stdio -m 1024M
 }
 
 function Create-VDI {
