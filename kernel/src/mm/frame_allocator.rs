@@ -67,9 +67,6 @@ impl FrameAllocator {
                 self.next_free_frame = self.next_free_frame + 1;
                 self.allocated_frames += 1;
                 
-                // Clear the frame for security
-                self.clear_frame(frame);
-                
                 return Ok(frame);
             }
             
@@ -79,9 +76,6 @@ impl FrameAllocator {
                 let frame = self.next_free_frame;
                 self.next_free_frame = self.next_free_frame + 1;
                 self.allocated_frames += 1;
-                
-                // Clear the frame for security
-                self.clear_frame(frame);
                 
                 return Ok(frame);
             }
