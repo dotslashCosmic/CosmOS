@@ -1,7 +1,7 @@
 # CosmOS Development Script
 param(
     [Parameter(Position=0)]
-    [ValidateSet("setup", "build", "build-uefi", "create-uefi-image", "run-qemu", "run-uefi-qemu", "run-vbox", "create-vdi", "update-vm", "clean", "help")]
+    [ValidateSet("setup", "build", "build-uefi", "create-uefi-image", "run-qemu", "run-uefi-qemu", "run-vbox", "create-vdi", "update-vm", "clean", "release", "help")]
     [string]$Command = "help",
     
     [ValidateSet("debug", "release")]
@@ -41,6 +41,7 @@ function Show-Help {
     Write-Host "  create-vdi         Create VirtualBox VDI"
     Write-Host "  update-vm          Update and restart VM"
     Write-Host "  clean              Clean build artifacts"
+    Write-Host "  release            Build all release artifacts"
     Write-Host "  help               Show this help"
     Write-Host ""
     Write-Host "Options:"
@@ -564,6 +565,60 @@ function Clean-Build {
     Write-Success "All build artifacts cleaned"
 }
 
+function Build-Release {
+    Write-Header "=== Building CosmOS Release Artifacts ==="
+    Write-Host ""
+    
+    # Build BIOS bootloader and kernel
+    Write-Success "Building BIOS bootloader and kernel..."
+    Build-CosmOS
+    
+    Write-Host ""
+    
+    # Build UEFI bootloader
+    Write-Success "Building UEFI bootloader..."
+    Build-UEFIBootloader | Out-Null
+    
+    Write-Host ""
+    
+    # Create release directory
+    $releaseDir = "release"
+    if (-not (Test-Path $releaseDir)) {
+        New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+    }
+    
+    # Copy artifacts
+    Write-Success "Copying release artifacts..."
+    
+    $artifacts = @{
+        "$script:TargetDir\bootimage-cosmos.bin" = "$releaseDir\cosmos-bios.bin"
+        "$script:TargetDir\BOOTX64.EFI" = "$releaseDir\BOOTX64.EFI"
+        "$script:TargetDir\cosmos.bin" = "$releaseDir\kernel.bin"
+        "$script:TargetDir\cosmos" = "$releaseDir\cosmos.elf"
+    }
+    
+    foreach ($src in $artifacts.Keys) {
+        $dst = $artifacts[$src]
+        if (Test-Path $src) {
+            Copy-Item $src $dst -Force
+            $size = (Get-Item $dst).Length
+            Write-Detail "  [OK] $(Split-Path $dst -Leaf) ($size bytes)"
+        } else {
+            Write-Error "Missing artifact: $src"
+        }
+    }
+    
+    Write-Host ""
+    Write-Success "=== Release Build Complete ==="
+    Write-Info "Artifacts location: $releaseDir\"
+    Write-Host ""
+    Write-Info "Release artifacts:"
+    Get-ChildItem $releaseDir | ForEach-Object {
+        Write-Detail "  $($_.Name) - $($_.Length) bytes"
+    }
+    Write-Host ""
+}
+
 # Main command dispatcher
 switch ($Command) {
     "setup" { Install-Dependencies }
@@ -576,6 +631,7 @@ switch ($Command) {
     "create-vdi" { Create-VDI }
     "update-vm" { Update-VM }
     "clean" { Clean-Build }
+    "release" { Build-Release }
     "help" { Show-Help }
     default { Show-Help }
 
