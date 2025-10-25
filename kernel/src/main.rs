@@ -3,7 +3,10 @@
 
 //! CosmOS Kernel Entry Point
 
+extern crate alloc;
+
 use cosmos::mm::MemoryMap;
+use alloc::vec::Vec;
 
 /// Simple serial port writer for COM1 (0x3F8)
 struct SerialPort {
@@ -148,9 +151,70 @@ impl DualWriter {
 
 static mut WRITER: DualWriter = DualWriter::new();
 
+/// Test heap allocation with a kernel signature
+fn test_heap_alloc<F>(label: &str, value_fn: F) 
+where
+    F: FnOnce() -> u64
+{
+    unsafe {
+        // Allocate and write
+        let mut test_box = alloc::boxed::Box::new(value_fn());
+        let value = *test_box;
+        
+        // Print label and value
+        let mut msg = [b' '; 80];
+        let mut pos = 0;
+        for &b in label.as_bytes() {
+            if pos < 40 {
+                msg[pos] = b;
+                pos += 1;
+            }
+        }
+        msg[pos] = b':';
+        pos += 1;
+        msg[pos] = b' ';
+        pos += 1;
+        msg[pos] = b'0';
+        pos += 1;
+        msg[pos] = b'x';
+        pos += 1;
+        
+        let hex_chars = b"0123456789ABCDEF";
+        for i in 0..16 {
+            let nibble = ((value >> (60 - i * 4)) & 0xF) as usize;
+            msg[pos] = hex_chars[nibble];
+            pos += 1;
+        }
+        WRITER.write_line(&msg[..pos], 0x0A00);
+        
+        // Get pointer before deallocation
+        let ptr = &*test_box as *const u64;
+        
+        // Deallocate
+        drop(test_box);
+        
+        // Check after deallocation
+        let after_dealloc = *ptr;
+        let mut msg = [b' '; 80];
+        let prefix = b"After free: 0x";
+        for (i, &b) in prefix.iter().enumerate() {
+            msg[i] = b;
+        }
+        let mut pos = prefix.len();
+        
+        for i in 0..16 {
+            let nibble = ((after_dealloc >> (60 - i * 4)) & 0xF) as usize;
+            msg[pos] = hex_chars[nibble];
+            pos += 1;
+        }
+        WRITER.write_line(&msg[..pos], 0x0E00);
+    }
+}
+
 #[no_mangle]
 #[link_section = ".rodata.signature"]
-static KERNEL_SIGNATURE: u32 = 0xC05305; // "CosmOS"
+// Format: 0xFyzFyzFyzFC05305 (where yz = 0xF01F05F63F = v1.5.99)
+static KERNEL_SIGNATURE: u64 = 0xF00F00F04FC05305; // CosmOS v0.0.4
 #[no_mangle]
 #[link_section = ".text._start"]
 pub extern "C" fn _start() -> ! {
@@ -160,22 +224,249 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         // Clear screen (VGA + Serial header)
         WRITER.clear_screen();
-        
+        let major = ((KERNEL_SIGNATURE >> 52) & 0xFF) as u8;
+        let minor = ((KERNEL_SIGNATURE >> 40) & 0xFF) as u8;
+        let patch = ((KERNEL_SIGNATURE >> 28) & 0xFF) as u8;
+
         // Write title in green (0x0B00)
-        let message = b"CosmOS Kernel v0.0.3";
-        for &byte in message {
+        for &byte in b"CosmOS Kernel v" {
             WRITER.write_byte(byte, 0x0B00);
         }
+        
+        // Write decimal number
+        let write_decimal = |mut num: u8| {
+            if num >= 100 {
+                WRITER.write_byte(b'0' + (num / 100), 0x0B00);
+                num %= 100;
+            }
+            if num >= 10 {
+                WRITER.write_byte(b'0' + (num / 10), 0x0B00);
+                num %= 10;
+            }
+            WRITER.write_byte(b'0' + num, 0x0B00);
+        };
+        
+        write_decimal(major);
+        WRITER.write_byte(b'.', 0x0B00);
+        write_decimal(minor);
+        WRITER.write_byte(b'.', 0x0B00);
+        write_decimal(patch);
         WRITER.write_byte(b'\n', 0x0F00);
         
-        // Test memory management
-        match MemoryMap::from_bootloader() {
-            Ok(_memory_map) => {
-                WRITER.write_line(b"Bootloader memory map parsed successfully!", 0x0A00);
+        // Parse memory map
+        let memory_map = match MemoryMap::from_bootloader() {
+            Ok(map) => map,
+            Err(_) => {
+                WRITER.write_line(b"Using fallback memory map (128MB)", 0x0E00);
+                MemoryMap::create_fallback()
+            }
+        };
+        
+        // Initialize frame allocator first
+        match cosmos::mm::frame_allocator::init_frame_allocator(memory_map) {
+            Ok(_) => {
+                // Nothing, it loaded
             }
             Err(_) => {
-                let _fallback_map = MemoryMap::create_fallback();
-                WRITER.write_line(b"Memory map parsed successfully!", 0x0A00);
+                WRITER.write_line(b"ERROR: Frame allocator init failed!", 0x0C00);
+            }
+        }
+        
+        // Set up full memory mapping
+        let memory_map = match MemoryMap::from_bootloader() {
+            Ok(map) => map,
+            Err(_) => MemoryMap::create_fallback()
+        };
+        
+        let total_physical_mb = memory_map.total_physical_memory() / (1024 * 1024);
+        let total_usable_mb = memory_map.total_usable_memory() / (1024 * 1024);
+        
+        match cosmos::mm::paging::init_full_memory_mapping(&memory_map) {
+            Ok(mapped_size) => {
+                let mapped_mb = mapped_size / (1024 * 1024);
+                let mut msg = [b' '; 80];
+                let prefix = b"Mapped: ";
+                for (i, &b) in prefix.iter().enumerate() {
+                    msg[i] = b;
+                }
+                let mut pos = prefix.len();
+                
+                // Convert mapped_mb to decimal
+                if mapped_mb == 0 {
+                    msg[pos] = b'0';
+                    pos += 1;
+                } else {
+                    let mut temp = mapped_mb;
+                    let mut digits = [0u8; 10];
+                    let mut digit_count = 0;
+                    while temp > 0 {
+                        digits[digit_count] = (temp % 10) as u8 + b'0';
+                        temp /= 10;
+                        digit_count += 1;
+                    }
+                    for i in 0..digit_count {
+                        msg[pos] = digits[digit_count - 1 - i];
+                        pos += 1;
+                    }
+                }
+                
+                let mid = b"MB / Usable: ";
+                for &b in mid {
+                    msg[pos] = b;
+                    pos += 1;
+                }
+                
+                // Add usable memory
+                if total_usable_mb == 0 {
+                    msg[pos] = b'0';
+                    pos += 1;
+                } else {
+                    let mut temp = total_usable_mb;
+                    let mut digits = [0u8; 10];
+                    let mut digit_count = 0;
+                    while temp > 0 {
+                        digits[digit_count] = (temp % 10) as u8 + b'0';
+                        temp /= 10;
+                        digit_count += 1;
+                    }
+                    for i in 0..digit_count {
+                        msg[pos] = digits[digit_count - 1 - i];
+                        pos += 1;
+                    }
+                }
+                
+                let suffix = b"MB";
+                for &b in suffix {
+                    msg[pos] = b;
+                    pos += 1;
+                }
+                
+                WRITER.write_line(&msg[..pos], 0x0A00);
+                
+                // Show total physical RAM
+                let mut msg = [b' '; 80];
+                let prefix = b"Total RAM: ";
+                for (i, &b) in prefix.iter().enumerate() {
+                    msg[i] = b;
+                }
+                let mut pos = prefix.len();
+                
+                if total_physical_mb == 0 {
+                    msg[pos] = b'0';
+                    pos += 1;
+                } else {
+                    let mut temp = total_physical_mb;
+                    let mut digits = [0u8; 10];
+                    let mut digit_count = 0;
+                    while temp > 0 {
+                        digits[digit_count] = (temp % 10) as u8 + b'0';
+                        temp /= 10;
+                        digit_count += 1;
+                    }
+                    for i in 0..digit_count {
+                        msg[pos] = digits[digit_count - 1 - i];
+                        pos += 1;
+                    }
+                }
+                
+                let suffix = b"MB";
+                for &b in suffix {
+                    msg[pos] = b;
+                    pos += 1;
+                }
+                WRITER.write_line(&msg[..pos], 0x0E00);
+                
+                // Show free memory available to map
+                let free_to_map = (total_usable_mb as isize - mapped_mb as isize).max(0) as u64;
+                let mut msg = [b' '; 80];
+                let prefix = b"free to map: ";
+                for (i, &b) in prefix.iter().enumerate() {
+                    msg[i] = b;
+                }
+                let mut pos = prefix.len();
+                
+                if free_to_map == 0 {
+                    msg[pos] = b'0';
+                    pos += 1;
+                } else {
+                    let mut temp = free_to_map;
+                    let mut digits = [0u8; 10];
+                    let mut digit_count = 0;
+                    while temp > 0 {
+                        digits[digit_count] = (temp % 10) as u8 + b'0';
+                        temp /= 10;
+                        digit_count += 1;
+                    }
+                    for i in 0..digit_count {
+                        msg[pos] = digits[digit_count - 1 - i];
+                        pos += 1;
+                    }
+                }
+                
+                let suffix = b"mb";
+                for &b in suffix {
+                    msg[pos] = b;
+                    pos += 1;
+                }
+                WRITER.write_line(&msg[..pos], 0x0E00);
+            }
+            Err(_) => {
+                WRITER.write_line(b"WARNING: Failed to expand memory mapping", 0x0E00);
+            }
+        }
+        
+        // Initialize heap with dynamic sizing
+        let total_memory = memory_map.total_usable_memory();
+        match cosmos::mm::heap::init_heap(total_memory) {
+            Ok(_) => {
+                let stats = cosmos::mm::heap::heap_stats();
+                let heap_mb = stats.total_size / (1024 * 1024);
+                
+                // Display heap size
+                let mut msg = [b' '; 80];
+                let prefix = b"Heap initialized: ";
+                for (i, &b) in prefix.iter().enumerate() {
+                    msg[i] = b;
+                }
+                let mut pos = prefix.len();
+                
+                // Convert heap_mb to decimal
+                if heap_mb == 0 {
+                    msg[pos] = b'0';
+                    pos += 1;
+                } else {
+                    let mut temp = heap_mb;
+                    let mut digits = [0u8; 10];
+                    let mut digit_count = 0;
+                    while temp > 0 {
+                        digits[digit_count] = (temp % 10) as u8 + b'0';
+                        temp /= 10;
+                        digit_count += 1;
+                    }
+                    for i in 0..digit_count {
+                        msg[pos] = digits[digit_count - 1 - i];
+                        pos += 1;
+                    }
+                }
+                
+                let suffix = b"MB available";
+                for &b in suffix {
+                    msg[pos] = b;
+                    pos += 1;
+                }
+                
+                WRITER.write_line(&msg[..pos], 0x0A00);
+                
+                // Quick heap test
+                WRITER.write_line(b"", 0x0F00);
+                WRITER.write_line(b"Testing heap allocation...", 0x0B00);
+                
+                test_heap_alloc("Kernel Signature", || {
+                    KERNEL_SIGNATURE
+                });
+            }
+            Err(_) => {
+                WRITER.write_line(b"ERROR: Heap initialization failed!", 0x0C00);
             }
         }
         
@@ -230,14 +521,12 @@ pub extern "C" fn _start() -> ! {
         
         let kernel_addrs = [
             (_start as *const () as usize, "Kernel Entry"),
-            (core::mem::size_of::<()> as *const () as usize, "size_of fn"),
-            (core::ptr::null::<()> as *const () as usize, "null ptr fn"),
-            (&KERNEL_SIGNATURE as *const u32 as usize, "Kernel Signature"),
+            (&KERNEL_SIGNATURE as *const u64 as usize, "Kernel Signature"),
         ];
         
         for (addr, desc) in kernel_addrs.iter() {
-            // Read the actual value at this address
-            let ptr = *addr as *const u32;
+            // Read the actual value at this address as 64-bit
+            let ptr = *addr as *const u64;
             let value = *ptr;
             
             let mut msg = [b' '; 80];
@@ -253,29 +542,28 @@ pub extern "C" fn _start() -> ! {
             msg[21] = b'0';
             msg[22] = b'x';
             
-            // Convert address to hex, 8 digits
+            // Convert address to hex, 64-bit
             let hex_chars = b"0123456789ABCDEF";
-            for i in 0..8 {
-                let nibble = ((*addr >> (28 - i * 4)) & 0xF) as usize;
+            for i in 0..16 {
+                let nibble = ((*addr >> (60 - i * 4)) & 0xF) as usize;
                 msg[23 + i] = hex_chars[nibble];
             }
 
-            // Add value at position 32
-            msg[32] = b'=';
-            msg[33] = b'0';
-            msg[34] = b'x';
+            // Add value at position 40
+            msg[40] = b'=';
+            msg[41] = b'0';
+            msg[42] = b'x';
             
-            // Show first 4 hex digits of value
-            for i in 0..4 {
-                let nibble = ((value >> (12 - i * 4)) & 0xF) as usize;
-                msg[35 + i] = hex_chars[nibble];
+            // Show 64-bit hex of value
+            for i in 0..16 {
+                let nibble = ((value >> (60 - i * 4)) & 0xF) as usize;
+                msg[43 + i] = hex_chars[nibble];
             }
             
-            WRITER.write_line(&msg[..40], 0x0E00);
+            WRITER.write_line(&msg[..59], 0x0E00);
         }
         
         // Final status
-        WRITER.write_line(b"Kernel initialization complete.", 0x0A00);
         WRITER.write_line(b"HALTING SAFELY...", 0x0A00);
     }
     
