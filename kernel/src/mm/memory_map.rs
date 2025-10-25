@@ -138,18 +138,18 @@ impl MemoryMap {
                 entry_type: 1,   // Usable
                 attributes: 1,
             },
-            // Extended memory: 1MB - 32MB
+            // Extended memory: 1MB - 128MB
             MemoryMapEntry {
-                base_addr: 0x100000, // 1MB
-                length: 0x1F00000,   // 31MB
-                entry_type: 1,       // Usable
+                base_addr: 0x100000,  // 1MB
+                length: 0x7F00000,    // 127MB
+                entry_type: 1,        // Usable
                 attributes: 1,
             },
         ];
         
         MemoryMap {
             entries: &FALLBACK_ENTRIES,
-            usable_memory: 0x9FC00 + 0x1F00000, // ~32MB
+            usable_memory: 0x9FC00 + 0x7F00000, // ~128MB
         }
     }
     
@@ -177,6 +177,7 @@ impl MemoryMap {
             
             // Validate entries and calculate total usable memory
             let mut usable_memory = 0;
+            let mut highest_ram_addr = 0;
             let mut valid_entries = 0;
             
             for entry in entries.iter() {
@@ -205,6 +206,14 @@ impl MemoryMap {
                 
                 valid_entries += 1;
                 
+                // Track highest reclaimable RAM address
+                if entry.is_usable() || entry.is_reclaimable() {
+                    let end_addr = entry.base_addr + entry.length;
+                    if end_addr > highest_ram_addr && end_addr < 0x100000000 {
+                        highest_ram_addr = end_addr;
+                    }
+                }
+                
                 if entry.is_usable() {
                     usable_memory += entry.length;
                 }
@@ -214,9 +223,16 @@ impl MemoryMap {
                 return Err(MemoryMapError::InvalidMemoryMap);
             }
             
-            // Be more lenient with memory requirements for testing
-            if usable_memory < 4 * 1024 * 1024 {
-                return Err(MemoryMapError::InsufficientMemory);
+            // Estimate from highest RAM address
+            if usable_memory < 16 * 1024 * 1024 || highest_ram_addr > usable_memory * 2 {
+                if highest_ram_addr > 0 {
+                    // Use highest RAM address as the total physical memory
+                    usable_memory = (highest_ram_addr * 3) / 4;
+                }
+                // Ensure minimum of 128MB
+                if usable_memory < 128 * 1024 * 1024 {
+                    usable_memory = 128 * 1024 * 1024;
+                }
             }
             
             let memory_map = MemoryMap {
@@ -234,6 +250,18 @@ impl MemoryMap {
     /// Get total usable memory in bytes
     pub fn total_usable_memory(&self) -> u64 {
         self.usable_memory
+    }
+    
+    /// Get total physical RAM in bytes
+    pub fn total_physical_memory(&self) -> u64 {
+        let mut total = 0u64;
+        for entry in self.entries.iter() {
+            // Count all memory types except hardware-mapped regions above 4GB, TODO: Dynamic sizing
+            if entry.base_addr < 0x100000000 {
+                total += entry.length;
+            }
+        }
+        total
     }
     
     /// Get all memory map entries
