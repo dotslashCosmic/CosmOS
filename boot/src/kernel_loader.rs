@@ -226,10 +226,43 @@ pub unsafe fn load_kernel_from_esp_root(
     
     println!(console, "Kernel loaded successfully");
     
+    // Verify CosmOS signature
+    if !verify_cosmos_signature(buffer, file_size) {
+        ((*boot_services).free_pool)(buffer);
+        error::display_simple_error_and_halt(
+            console,
+            "Kernel verification failed - CosmOS signature not found",
+        );
+    }
+    
+    println!(console, "Kernel signature verified");
+    
     KernelBuffer {
         data_ptr: buffer as *const u8,
         size: file_size,
     }
+}
+
+/// Verify CosmOS kernel signature (0xFxxFxxFxxFC05305)
+unsafe fn verify_cosmos_signature(buffer: *const u8, size: usize) -> bool {
+    const COSMOS_MAGIC: u32 = 0x0FC05305; // Lower 28 bits of signature
+    
+    // Search first 64KB or entire kernel if smaller
+    let search_size = if size > 65536 { 65536 } else { size };
+    
+    // Search for signature, 8 byte aligned
+    let mut offset = 0;
+    while offset + 8 <= search_size {
+        let ptr = buffer.add(offset) as *const u64;
+        let value = *ptr;
+        
+        // Check if lower 28 bits match CosmOS magic, 0x0FFFFFFF mask
+        if (value & 0x0FFFFFFF) as u32 == COSMOS_MAGIC {
+            return true;
+        }
+        offset += 8;
+    }
+    false
 }
 
 /// Print a number to console
