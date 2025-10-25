@@ -7,7 +7,8 @@ use spin::Mutex;
 
 /// Heap configuration constants
 pub const HEAP_START: usize = 0x400000; // 4MB
-pub const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4MB initial
+pub const MIN_HEAP_SIZE: usize = 4 * 1024 * 1024; // 4MB minimum
+pub const MAX_HEAP_SIZE: usize = 256 * 1024 * 1024; // 256MB maximum
 
 /// Global allocator instance
 #[global_allocator]
@@ -15,6 +16,9 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 /// Heap initialization state
 static HEAP_INITIALIZED: Mutex<bool> = Mutex::new(false);
+
+/// Actual heap size (determined at runtime)
+static HEAP_SIZE: Mutex<usize> = Mutex::new(0);
 
 /// Errors that can occur during heap operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,8 +44,8 @@ impl core::fmt::Display for HeapError {
     }
 }
 
-/// Initialize the kernel heap
-pub fn init_heap() -> Result<(), HeapError> {
+/// Initialize the kernel heap with dynamic sizing
+pub fn init_heap(total_usable_memory: u64) -> Result<(), HeapError> {
     let mut initialized = HEAP_INITIALIZED.lock();
     if *initialized {
         return Err(HeapError::AlreadyInitialized);
@@ -52,28 +56,38 @@ pub fn init_heap() -> Result<(), HeapError> {
         return Err(HeapError::InvalidConfiguration);
     }
     
-    if HEAP_SIZE % PhysicalFrame::SIZE as usize != 0 {
+    // Calculate heap size dynamically    
+    const LOW_MEMORY_RESERVED: usize = 0x100000;      // 1MB
+    const KERNEL_RESERVED: usize = 0x200000;          // 2MB (0x200000-0x400000)
+    const OVERHEAD_RESERVED: usize = 0x200000;        // 2MB for stacks/tables
+    const TOTAL_RESERVED: usize = LOW_MEMORY_RESERVED + KERNEL_RESERVED + OVERHEAD_RESERVED;
+    
+    // Heap gets everything else that's mapped and usable
+    let mapped_memory = super::paging::get_mapped_memory();
+    
+    // Calculate: mapped memory - heap start address = available for heap
+    // (heap starts at 0x400000, so everything from there to end of mapped memory)
+    let available_for_heap = mapped_memory.saturating_sub(HEAP_START);
+    
+    // Clamp to min/max bounds
+    let final_heap_size = available_for_heap
+        .max(MIN_HEAP_SIZE)
+        .min(MAX_HEAP_SIZE);
+    
+    // Round down to frame boundary
+    let final_heap_size = (final_heap_size / PhysicalFrame::SIZE as usize) 
+        * PhysicalFrame::SIZE as usize;
+    
+    if final_heap_size < MIN_HEAP_SIZE {
         return Err(HeapError::InvalidConfiguration);
     }
     
-    // Calculate number of frames needed
-    let frames_needed = HEAP_SIZE / PhysicalFrame::SIZE as usize;
-    
-    // Allocate physical frames for heap without vectors
-    for _ in 0..frames_needed {
-        match allocate_frame() {
-            Ok(_frame) => {
-                // Frame allocated
-            }
-            Err(_) => {
-                return Err(HeapError::FrameAllocationFailed);
-            }
-        }
-    }
-    // TODO: Set up page tableshere for identity mapping
-    // Initialize the heap allocator
+    // Store the actual heap size
+    *HEAP_SIZE.lock() = final_heap_size;
+
+    // Initialize the heap allocator with dynamic size
     unsafe {
-        ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
+        ALLOCATOR.lock().init(HEAP_START as *mut u8, final_heap_size);
     }
     *initialized = true;
     Ok(())
@@ -87,8 +101,9 @@ pub fn is_initialized() -> bool {
 /// Get heap statistics
 pub fn heap_stats() -> HeapStats {
     let heap = ALLOCATOR.lock();
+    let total_size = *HEAP_SIZE.lock();
     HeapStats {
-        total_size: HEAP_SIZE,
+        total_size,
         used_size: heap.used(),
         free_size: heap.free(),
         start_address: HEAP_START,
