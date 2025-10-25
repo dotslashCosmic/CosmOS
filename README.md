@@ -1,6 +1,7 @@
 # CosmOS
 
 CosmOS (Custom Open-Source Modular Operating System) is a fully custom kernel and bootloader written in Rust and Assembly. It is designed with memory safety and exploit resistance as core principles.
+![cosmos-vbox](https://github.com/user-attachments/assets/73afbcbb-82c8-454e-8d95-cb299ac63ac0)
 
 ## Architecture
 
