@@ -176,7 +176,7 @@ pub unsafe fn store_e820_map(
     print_decimal(console, e820_count);
 }
 
-/// Copy kernel from UEFI buffer to final address (0x200000)
+/// Copy kernel from UEFI buffer to final address
 pub unsafe fn copy_kernel_to_final_address(
     kernel_ptr: *const u8,
     kernel_size: usize,
@@ -260,6 +260,27 @@ unsafe fn print_hex_byte(console: *mut EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL, byte: u8
     ((*console).output_string)(console, buffer.as_ptr());
 }
 
+/// Calculate total physical memory from UEFI memory map
+unsafe fn calculate_total_memory(descriptor_size: usize, descriptor_count: usize) -> u64 {
+    let mut highest_address = 0u64;
+    
+    for i in 0..descriptor_count {
+        let desc_ptr = MEMORY_MAP_BUFFER.as_ptr().add(i * descriptor_size) as *const EFI_MEMORY_DESCRIPTOR;
+        let desc = &*desc_ptr;
+        
+        // Calculate end address of this region
+        let end_address = desc.physical_start + (desc.number_of_pages * 4096);
+        
+        // Only consider memory below 4GB to avoid hardware-mapped regions
+        // TODO: Dynamically check
+        if end_address < 0x100000000 && end_address > highest_address {
+            highest_address = end_address;
+        }
+    }
+    
+    highest_address
+}
+
 /// Print a decimal number
 unsafe fn print_decimal(console: *mut EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL, num: usize) {
     if num == 0 {
@@ -290,53 +311,108 @@ unsafe fn print_decimal(console: *mut EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL, num: usiz
 /// Page table entry flags
 const PAGE_PRESENT: u64 = 1 << 0;      // Page is present in memory
 const PAGE_WRITABLE: u64 = 1 << 1;     // Page is writable
-const PAGE_SIZE: u64 = 1 << 7;         // Page size bit (for 2MB pages in PD)
+const PAGE_SIZE: u64 = 1 << 7;         // Page size bit, for 2MB pages in PD
 
 /// Set up page tables for long mode
-pub unsafe fn setup_page_tables(console: *mut EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL) {
+pub unsafe fn setup_page_tables(
+    console: *mut EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL,
+    descriptor_size: usize,
+    descriptor_count: usize,
+) {
     const PML4_ADDRESS: usize = 0x70000;
     const PDPT_ADDRESS: usize = 0x71000;
-    const PD_ADDRESS: usize = 0x72000;
+    const PD_BASE_ADDRESS: usize = 0x72000;
     
     println!(console, "Setting up page tables...");
 
-    const PAGES_TO_MAP: usize = 128; // 128 * 2MB = 256MB
+    // Calculate how much memory to map based on available memory
+    let total_memory = calculate_total_memory(descriptor_size, descriptor_count);
     
-    // Zero out three page tables
+    // Round down to nearest 2MB page boundary
+    let memory_to_map = (total_memory / (2 * 1024 * 1024)) * (2 * 1024 * 1024);
+    
+    // Calculate pages needed
+    let mut pages_to_map = (memory_to_map / (2 * 1024 * 1024)) as usize;
+    
+    // Ensure minimum of 256MB (128 pages) for low memory systems
+    if pages_to_map < 128 {
+        pages_to_map = 128;
+    }
+    
+    // Cap at 4GB for safety, TODO: Dynamically check
+    pages_to_map = pages_to_map.min(2048);
+    
+    // Calculate how many Page Directories we need, 512 entries per PD, each entry = 2MB
+    let mut pd_count = (pages_to_map + 511) / 512;
+    
+    // Zero out page tables
     let pml4_ptr = PML4_ADDRESS as *mut u64;
     let pdpt_ptr = PDPT_ADDRESS as *mut u64;
-    let pd_ptr = PD_ADDRESS as *mut u64;
     
-    // Zero out PML4, 512
+    // Zero out PML4
     for i in 0..512 {
         *pml4_ptr.add(i) = 0;
     }
     
-    // Zero out PDPT, 512
+    // Zero out PDPT
     for i in 0..512 {
         *pdpt_ptr.add(i) = 0;
     }
     
-    // Zero out PD, 512
-    for i in 0..512 {
-        *pd_ptr.add(i) = 0;
+    // Zero out used page directories
+    for pd_idx in 0..pd_count {
+        let pd_ptr = (PD_BASE_ADDRESS + pd_idx * 0x1000) as *mut u64;
+        for i in 0..512 {
+            *pd_ptr.add(i) = 0;
+        }
     }
     
     // Set up PML4[0] to point to PDPT
     *pml4_ptr = (PDPT_ADDRESS as u64) | PAGE_PRESENT | PAGE_WRITABLE;
     
-    // Set up PDPT[0] to point to PD
-    *pdpt_ptr = (PD_ADDRESS as u64) | PAGE_PRESENT | PAGE_WRITABLE;
-    
-    // Set up PD entries to identity map first 64MB using 2MB pages
-    for i in 0..PAGES_TO_MAP {
-        let physical_address = (i * 2 * 1024 * 1024) as u64;
-        *pd_ptr.add(i) = physical_address | PAGE_PRESENT | PAGE_WRITABLE | PAGE_SIZE;
+    // Set up PDPT entries to point to page directories
+    for pd_idx in 0..pd_count {
+        let pd_address = PD_BASE_ADDRESS + pd_idx * 0x1000;
+        *pdpt_ptr.add(pd_idx) = (pd_address as u64) | PAGE_PRESENT | PAGE_WRITABLE;
     }
+    
+    // Set up PD entries to identity map using 2MB pages
+    for i in 0..pages_to_map {
+        let pd_idx = i / 512; // Which PD
+        let entry_idx = i % 512; // Which entry in that PD
+        let pd_ptr = (PD_BASE_ADDRESS + pd_idx * 0x1000) as *mut u64;
+        let physical_address = (i * 2 * 1024 * 1024) as u64;
+        *pd_ptr.add(entry_idx) = physical_address | PAGE_PRESENT | PAGE_WRITABLE | PAGE_SIZE;
+    }
+    
+    let mapped_mb = pages_to_map * 2;
     
     println!(console, "Page tables created:");
     println!(console, "  PML4 at 0x70000");
     println!(console, "  PDPT at 0x71000");
-    println!(console, "  PD at 0x72000");
-    println!(console, "  Identity mapped 0-256MB (2MB pages)");
+    
+    // Print PD locations
+    for pd_idx in 0..pd_count {
+        println!(console, "  PD");
+        print_decimal(console, pd_idx);
+        println!(console, " at 0x");
+        print_hex_word(console, (PD_BASE_ADDRESS + pd_idx * 0x1000) as u32);
+    }
+    
+    println!(console, "  Identity mapped 0-");
+    print_decimal(console, mapped_mb);
+    println!(console, "MB (2MB pages)");
+}
+
+/// Print 32-bit hexadecimal word
+unsafe fn print_hex_word(console: *mut EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL, value: u32) {
+    let hex_chars = b"0123456789ABCDEF";
+    let mut buffer = [0u16; 9]; // 8 hex digits + null terminator
+    
+    for i in 0..8 {
+        buffer[i] = hex_chars[((value >> (28 - i * 4)) & 0xF) as usize] as u16;
+    }
+    buffer[8] = 0; // Null terminator
+    
+    ((*console).output_string)(console, buffer.as_ptr());
 }
