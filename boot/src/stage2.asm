@@ -616,62 +616,65 @@ reset_disk:
     int 0x13
     ret
 
-; Verify kernel has valid signature or basic checksum
+; Verify kernel has CosmOS signature, 64-bit, 0xF(major)F(minor)F(patch)FC05305
 verify_kernel_signature:
     push ax
     push bx
     push cx
     push dx
+    push si
+    push di
     push es
     
     mov ax, KERNEL_TEMP_SEGMENT
     mov es, ax
     
-    ; Check for ELF magic number first (0x7F454C46 = "\x7FELF")
-    ; TODO: Implement full ELF entry parsing, and header loading
-    mov eax, dword [es:0]
-    cmp eax, 0x464C457F     ; ELF magic, little-endian
-    je .valid_elf
+    ; Constants for signature search
+    mov ecx, 65536          ; Search first 64KB
+    mov ebx, KERNEL_SECTORS * 512  ; Actual kernel size
+    cmp ecx, ebx
+    jbe .search_size_ok
+    mov ecx, ebx            ; Use kernel size if smaller than 64KB
     
-    ; Flat binary, default
-    test eax, eax
-    jz .invalid
+.search_size_ok:
+    xor si, si              ; Offset = 0
     
-    ; Check if it looks like x86-64 code
-    mov al, byte [es:0]
-    cmp al, 0x48            ; REX.W prefix
-    je .likely_code
-    cmp al, 0x55            ; PUSH RBP
-    je .likely_code
-    cmp al, 0xE9            ; JMP rel32
-    je .likely_code
+.search_loop:
+    ; Check if we have 8 bytes left to read
+    mov eax, ecx
+    sub eax, esi
+    cmp eax, 8
+    jb .not_found           ; Less than 8 bytes left
     
-    ; Simple checksum of first 64 bytes for raw binary
-    xor dx, dx              ; Checksum accumulator
-    mov cx, 32              ; Check 32 words
-    xor bx, bx
-.checksum_loop:
-    add dx, word [es:bx]
-    add bx, 2
-    dec cx
-    jnz .checksum_loop
+    ; Read 64-bit value at ES:SI
+    ; Read lower 32 bits
+    mov eax, dword [es:si]
+    ; Read upper 32 bits
+    mov edx, dword [es:si+4]
     
-    ; Verify checksum is non-zero
-    test dx, dx
-    jz .invalid
-    cmp dx, 0x0020          ; Reasonable checksum
-    jb .invalid
+    ; Check if lower 28 bits match 0xFC05305
+    ; Mask: 0x0FFFFFFF (28 bits)
+    and eax, 0x0FFFFFFF
+    cmp eax, 0x0FC05305
+    je .found_signature
     
-.likely_code:
-.valid_elf:
+    ; Move to next 8-byte aligned position
+    add si, 8
+    jmp .search_loop
+    
+.found_signature:
+    ; Valid CosmOS signature found
     clc                     ; Clear carry - valid
     jmp .done
     
-.invalid:
+.not_found:
+    ; Signature not found
     stc                     ; Set carry - invalid
     
 .done:
     pop es
+    pop di
+    pop si
     pop dx
     pop cx
     pop bx
@@ -873,34 +876,9 @@ protected_mode:
     mov edi, KERNEL_FINAL_ADDRESS      ; Destination: final kernel location
     mov ecx, KERNEL_SECTORS * 512 / 4  ; Convert to dwords (127 * 512 / 4 = 16256)
     
-    ; Verify source has valid data before copying
-    mov eax, dword [esi]
-    test eax, eax
-    jz copy_error
-    
-    ; Additional verification
-    mov eax, dword [esi + 512]  ; Check second sector
-    test eax, eax
-    jz copy_error
-    
-    ; Perform the copy
+    ; Perform the copy (signature already verified in 16-bit mode)
     cld                     ; Ensure forward direction
     rep movsd
-    
-    ; Verify copy completed successfully
-    mov eax, dword [KERNEL_FINAL_ADDRESS]
-    test eax, eax
-    jz copy_error
-    
-    jmp copy_done
-
-copy_error:
-    ; Kernel wasn't loaded properly
-    mov esi, msg_copy_error
-    call print_string_32
-    jmp hang_32
-
-copy_done:
     
     ; Check for long mode
     mov eax, 0x80000000
@@ -936,19 +914,54 @@ copy_done:
     mov dword [edi], eax    ; Lower 32 bits
     mov dword [edi+4], 0    ; Upper 32 bits
     
-    ; PD at 0x72000, identity map 32MB with 2MB pages, 16 entries
+    ; Calculate how much memory to map from E820
+    call calculate_pages_to_map  ; Returns page count in ECX
+    push ecx                     ; Save for later
+    
+    ; Calculate PD count (pages / 512, rounded up)
+    mov eax, ecx
+    add eax, 511
+    shr eax, 9              ; Divide by 512
+    test eax, eax
+    jnz .pd_count_ok
+    mov eax, 1              ; Minimum 1 PD
+.pd_count_ok:
+    push eax                ; Save PD count
+    
+    ; Set up PDPT entries for all PDs
+    mov edi, 0x71000
+    mov esi, 0x72000        ; First PD address
+    mov ebx, eax            ; PD count
+.setup_pdpt_loop:
+    test ebx, ebx
+    jz .pdpt_done
+    mov eax, esi
+    or eax, 0x03
+    mov [edi], eax
+    mov dword [edi+4], 0
+    add edi, 8
+    add esi, 0x1000
+    dec ebx
+    jmp .setup_pdpt_loop
+.pdpt_done:
+    
+    ; Map all pages
+    pop eax                 ; Restore PD count (not needed)
+    pop ecx                 ; Restore page count
     mov edi, 0x72000
-    mov edx, 0              ; Physical address base
-    mov ecx, 16             ; Map 16 entries, 32MB total
-.map_loop:
-    mov eax, edx            ; Physical address base
-    or eax, 0x83            ; Add present + writable + 2MB page flags
-    mov [edi], eax          ; Lower 32 bits
-    mov dword [edi+4], 0    ; Upper 32 bits, always 0 for addresses < 4GB
-    add edx, 0x200000       ; Next 2MB physical address, fixed from eax to edx
-    add edi, 8              ; Next page directory entry bytes
+    mov edx, 0
+.map_all_pages:
+    test ecx, ecx
+    jz .mapping_done
+    mov eax, edx
+    or eax, 0x83
+    mov [edi], eax
+    mov dword [edi+4], 0
+    add edx, 0x200000
+    add edi, 8
     dec ecx
-    jnz .map_loop
+    jmp .map_all_pages
+.mapping_done:
     
     ; Load CR3 with PML4 address
     mov eax, 0x70000
@@ -972,6 +985,80 @@ copy_done:
     
     ; Jump to 64-bit code
     jmp 0x18:long_mode
+
+; Calculate pages to map based on E820 memory map
+; Returns: ECX = number of 2MB pages to map
+calculate_pages_to_map:
+    push eax
+    push ebx
+    push edx
+    push esi
+    
+    ; Get entry count from memory map
+    mov esi, MEMORY_MAP_LOCATION
+    movzx ebx, word [esi]    ; Entry count
+    add esi, 4               ; Skip to first entry
+    
+    xor edx, edx             ; EDX = highest usable RAM address found
+    
+.scan_loop:
+    test ebx, ebx
+    jz .scan_done
+    
+    ; Check memory type (offset 16, 4 bytes)
+    mov eax, [esi + 16]      ; Memory type
+    cmp eax, MEMTYPE_USABLE  ; Only consider usable RAM (type 1)
+    jne .next_entry
+    
+    ; Read entry: base (8 bytes) + length (8 bytes)
+    mov eax, [esi + 8]       ; Length low 32 bits
+    test eax, eax
+    jz .next_entry
+    
+    ; Calculate end address = base + length
+    mov eax, [esi]           ; Base low 32 bits
+    add eax, [esi + 8]       ; Add length low 32 bits
+    jc .next_entry           ; Skip if overflow
+    
+    ; Ignore addresses above 4GB (hardware mapped regions)
+    test eax, eax
+    js .next_entry           ; Skip if bit 31 set (>2GB might be hardware)
+    
+    ; Check if this is higher than current max
+    cmp eax, edx
+    jbe .next_entry
+    mov edx, eax             ; Update highest address
+    
+.next_entry:
+    add esi, 24              ; Next entry (24 bytes)
+    dec ebx
+    jmp .scan_loop
+    
+.scan_done:
+    ; EDX now has highest usable RAM address
+    ; Round up to 2MB boundary and convert to page count
+    add edx, 0x1FFFFF        ; Round up
+    shr edx, 21              ; Divide by 2MB (2^21)
+    
+    ; Ensure minimum of 64 pages (128MB)
+    cmp edx, 64
+    jae .count_ok
+    mov edx, 64
+.count_ok:
+    
+    ; Cap at 2048 pages (4GB)
+    cmp edx, 2048
+    jbe .no_cap
+    mov edx, 2048
+.no_cap:
+    
+    mov ecx, edx             ; Return in ECX
+    
+    pop esi
+    pop edx
+    pop ebx
+    pop eax
+    ret
 
 no_long_mode:
     ; Print error and hang
@@ -1001,7 +1088,6 @@ hang_32:
     jmp hang_32
 
 msg_no_long_mode db 'CPU is not 64-bit!', 0
-msg_copy_error db 'ERROR: Kernel not loaded from disk!', 0
 
 ; 64-bit long mode code
 [BITS 64]
